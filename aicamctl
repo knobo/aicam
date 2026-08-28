@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+"""Command line front end for a running aicam."""
+
+import argparse
+import json
+import os
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import control  # noqa: E402
+
+
+def main():
+    p = argparse.ArgumentParser(description="control a running aicam")
+    p.add_argument("command", nargs="?", default="state",
+                   help="a scene name (confetti, hearts, fireworks, balloons, rain), "
+                        "'state', 'clear', or 'set'")
+    p.add_argument("args", nargs="*", help="for 'set': key=value pairs")
+    p.add_argument("--socket", default=None)
+    a = p.parse_args()
+
+    if a.command == "state":
+        msg = {"query": "state"}
+    elif a.command == "set":
+        values = {}
+        for item in a.args:
+            if "=" not in item:
+                sys.exit(f"aicamctl: expected key=value, got {item!r}")
+            k, v = item.split("=", 1)
+            try:
+                values[k] = float(v)
+            except ValueError:
+                values[k] = v
+        msg = {"set": values}
+    elif a.command == "clear":
+        msg = {"clear": True}
+    else:
+        msg = {"trigger": a.command}
+
+    try:
+        reply = control.send(msg, a.socket)
+    except ConnectionError as exc:
+        sys.exit(f"aicamctl: {exc}")
+    print(json.dumps(reply.get("state", reply), indent=2, ensure_ascii=False))
+
+
+if __name__ == "__main__":
+    main()

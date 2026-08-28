@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+models/*.task
+backgrounds/*
+!backgrounds/studio.jpg
+!backgrounds/.gitkeep

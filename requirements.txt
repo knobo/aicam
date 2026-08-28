@@ -1,0 +1,12 @@
+# Core pipeline. torch must match your CUDA runtime; see pytorch.org for the
+# right index URL for your driver.
+torch>=2.0
+opencv-python-headless>=4.8
+numpy>=1.24
+timm>=0.9            # required by the MiDaS torch.hub entry point
+
+# Gestures. Installed with --no-deps so it does not replace opencv-python-headless
+# with opencv-contrib-python, which would shadow the build the rest of this uses.
+#   pip install --no-deps mediapipe
+#   pip install absl-py flatbuffers protobuf attrs sounddevice matplotlib
+mediapipe>=1.0 ; extra == "gestures"

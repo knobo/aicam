@@ -1,0 +1,211 @@
+"""Image effects for aicam. Everything runs on the GPU and expects [1,3,H,W] in 0..1."""
+
+import torch
+import torch.nn.functional as F
+
+
+# ---------------------------------------------------------------- kernels
+
+def gaussian_kernel1d(sigma, device, dtype):
+    radius = max(1, int(3 * sigma))
+    x = torch.arange(-radius, radius + 1, device=device, dtype=dtype)
+    k = torch.exp(-(x ** 2) / (2 * sigma ** 2))
+    return k / k.sum()
+
+
+def separable_blur(img, sigma):
+    """Gaussian blur as two 1D convolutions."""
+    k = gaussian_kernel1d(sigma, img.device, img.dtype)
+    n = k.numel()
+    pad = n // 2
+    c = img.shape[1]
+    kh = k.view(1, 1, 1, n).expand(c, 1, 1, n)
+    kv = k.view(1, 1, n, 1).expand(c, 1, n, 1)
+    img = F.conv2d(F.pad(img, (pad, pad, 0, 0), mode="reflect"), kh, groups=c)
+    img = F.conv2d(F.pad(img, (0, 0, pad, pad), mode="reflect"), kv, groups=c)
+    return img
+
+
+def bokeh(img, strength):
+    """Cheap heavy defocus: downscale, blur, upscale.
+
+    Blurring at quarter scale looks the same as a large kernel at a fraction of
+    the cost, and the interpolation softness on the way back up is free.
+    """
+    h, w = img.shape[-2:]
+    small = F.interpolate(img, scale_factor=0.25, mode="bilinear", align_corners=False)
+    small = separable_blur(small, max(1.0, strength / 4.0))
+    return F.interpolate(small, size=(h, w), mode="bilinear", align_corners=False)
+
+
+def disc_kernel(radius, device, dtype):
+    """Flat circular kernel - what gives bokeh a defined edge instead of mush.
+
+    A Gaussian spreads a point of light into a soft blob. A lens spreads it into
+    a hard-edged disc shaped by the aperture. That disc is what reads as "camera"
+    rather than "filter".
+    """
+    r = max(1, int(round(radius)))
+    n = 2 * r + 1
+    y, x = torch.meshgrid(
+        torch.arange(n, device=device, dtype=dtype) - r,
+        torch.arange(n, device=device, dtype=dtype) - r,
+        indexing="ij",
+    )
+    d = torch.sqrt(x ** 2 + y ** 2)
+    k = (r + 0.5 - d).clamp(0, 1)     # soft rim, otherwise the disc staircases
+    return k / k.sum()
+
+
+def disc_blur(img, radius):
+    k = disc_kernel(radius, img.device, img.dtype)
+    n = k.shape[-1]
+    c = img.shape[1]
+    k = k.view(1, 1, n, n).expand(c, 1, n, n)
+    return F.conv2d(F.pad(img, (n // 2,) * 4, mode="reflect"), k, groups=c)
+
+
+# ---------------------------------------------------------------- depth of field
+
+def highlight_boost(img, threshold, gain):
+    """Lift the brightest points before blurring so they bloom into discs.
+
+    Without this a highlight is simply averaged away. A lens preserves the
+    energy: a small very bright spot becomes a large, still visible disc.
+    """
+    weights = torch.tensor([0.2126, 0.7152, 0.0722], device=img.device,
+                           dtype=img.dtype).view(1, 3, 1, 1)
+    luma = (img * weights).sum(1, keepdim=True)
+    excess = (luma - threshold).clamp(min=0) / max(1e-3, 1.0 - threshold)
+    return img * (1.0 + gain * excess ** 2)
+
+
+def layered_bokeh(img, coc, max_radius, levels=4):
+    """Per-pixel varying defocus driven by `coc` (0 = sharp, 1 = maximum).
+
+    True varying blur needs per-pixel scatter. We approximate with a few
+    pre-blurred layers and a triangular weighting between them - a standard
+    real-time graphics trick, and indistinguishable in motion.
+    """
+    h, w = img.shape[-2:]
+    small = F.interpolate(img, scale_factor=0.25, mode="bilinear", align_corners=False)
+
+    stack = [small]
+    for i in range(1, levels):
+        radius = max_radius * (i / (levels - 1)) / 4.0    # /4 because we are at quarter scale
+        stack.append(disc_blur(small, max(1.0, radius)))
+
+    coc_small = F.interpolate(coc, size=small.shape[-2:], mode="bilinear", align_corners=False)
+    pos = coc_small.clamp(0, 1) * (levels - 1)
+
+    out = torch.zeros_like(small)
+    for i, layer in enumerate(stack):
+        out = out + layer * (1.0 - (pos - i).abs()).clamp(min=0)
+
+    return F.interpolate(out, size=(h, w), mode="bilinear", align_corners=False)
+
+
+def circle_of_confusion(depth, alpha, strength, focus_softness=0.15):
+    """How defocused each pixel should be, from how far behind the subject it is.
+
+    `depth` is MiDaS inverse depth: 1 = near, 0 = far. The focus plane is taken
+    from the subject's own depth, read where the matte is confident, so it
+    follows you if you lean forward or back.
+
+    Note the clamp: nothing in *front* of the focus plane is blurred at all,
+    which is why a book you hold up stays sharp.
+    """
+    solid = (alpha > 0.9).to(depth.dtype)
+    if solid.sum() > 100:
+        focus = (depth * solid).sum() / solid.sum()
+    else:
+        focus = depth.median()
+
+    behind = (focus - depth).clamp(min=0)
+    return ((behind / max(1e-3, focus_softness)).clamp(0, 1) * strength).clamp(0, 1)
+
+
+# ---------------------------------------------------------------- studio light
+
+def depth_normals(depth, strength=40.0):
+    """Approximate surface normals from the depth map.
+
+    Not geometrically correct - MiDaS gives relative, not metric depth - but
+    good enough to tell which way a surface leans, which is all the lighting
+    needs.
+    """
+    d = separable_blur(depth, 3.0)
+    dx = F.pad(d[..., :, 1:] - d[..., :, :-1], (0, 1, 0, 0), mode="replicate")
+    dy = F.pad(d[..., 1:, :] - d[..., :-1, :], (0, 0, 0, 1), mode="replicate")
+    n = torch.cat([-dx * strength, -dy * strength, torch.ones_like(d)], dim=1)
+    return n / n.norm(dim=1, keepdim=True).clamp(min=1e-6)
+
+
+def studio_light(img, alpha, depth, key=0.25, rim=0.4, direction=(-0.5, -0.6, 0.6),
+                 key_tint=(1.05, 1.0, 0.95), rim_tint=(0.95, 0.98, 1.10)):
+    """A virtual key and rim light on the subject.
+
+    The key light is Lambertian shading against the normals, which lifts one
+    side of the face and gives it shape. The rim light sits on the silhouette
+    where it faces the light, and is the trick that separates subject from
+    background - it is why portrait photographers put a lamp behind the subject.
+    """
+    device, dtype = img.device, img.dtype
+    L = torch.tensor(direction, device=device, dtype=dtype)
+    L = L / L.norm()
+
+    out = img
+
+    if key > 0:
+        n = depth_normals(depth)
+        shade = (n * L.view(1, 3, 1, 1)).sum(1, keepdim=True).clamp(min=0)
+        shade = separable_blur(shade, 8.0)      # a soft source, not a point light
+
+        # Subtract the mean over the subject so the light *shapes* the face
+        # rather than merely brightening it. Without this the whole face is
+        # lifted equally and the result reads as washed out, not as lit.
+        shade = shade - (shade * alpha).sum() / alpha.sum().clamp(min=1.0)
+
+        tint = torch.tensor(key_tint, device=device, dtype=dtype).view(1, 3, 1, 1)
+        out = out * (1.0 + key * shade * alpha * tint)
+
+    if rim > 0:
+        k = 9
+        eroded = -F.max_pool2d(-alpha, k, stride=1, padding=k // 2)
+        edge = (alpha - eroded).clamp(0, 1)
+
+        ax = F.pad(alpha[..., :, 1:] - alpha[..., :, :-1], (0, 1, 0, 0), mode="replicate")
+        ay = F.pad(alpha[..., 1:, :] - alpha[..., :-1, :], (0, 0, 0, 1), mode="replicate")
+        facing = (-(ax * L[0] + ay * L[1])).clamp(min=0)
+        facing = facing / facing.amax().clamp(min=1e-6)
+
+        glow = separable_blur(edge * facing, 4.0)
+        tint = torch.tensor(rim_tint, device=device, dtype=dtype).view(1, 3, 1, 1)
+        out = out + rim * glow * tint
+
+    return out.clamp(0, 1)
+
+
+# ---------------------------------------------------------------- background replacement
+
+def near_field_mask(coc, alpha, threshold=0.35, feather=9.0):
+    """What to keep from the real image: the subject, plus anything in focus.
+
+    A matte alone only knows "person" and "not person", so a book you hold up
+    vanishes the moment segmentation stops counting it as part of you. Depth
+    knows the book is nearer than the wall, so we keep everything at or in
+    front of the focus plane and replace only what lies behind.
+    """
+    near = (1.0 - coc / max(1e-3, threshold)).clamp(0, 1)
+    keep = (alpha + near * (1.0 - alpha)).clamp(0, 1)
+    keep = separable_blur(keep, feather)      # the depth map is coarse at edges
+    # Not decoration: the blur above can pull keep below alpha along the
+    # silhouette, which would partly replace the edge of the subject.
+    return torch.maximum(keep, alpha)
+
+
+def replace_background(src, fgr, alpha, coc, bg_image, threshold=0.35):
+    """Replace the background, leaving whatever is in focus standing."""
+    keep = near_field_mask(coc, alpha, threshold)
+    extra = (keep - alpha).clamp(min=0)       # in focus, but not the subject
+    return fgr * alpha + src * extra + bg_image * (1.0 - alpha - extra)
