@@ -209,3 +209,139 @@ def replace_background(src, fgr, alpha, coc, bg_image, threshold=0.35):
     keep = near_field_mask(coc, alpha, threshold)
     extra = (keep - alpha).clamp(min=0)       # in focus, but not the subject
     return fgr * alpha + src * extra + bg_image * (1.0 - alpha - extra)
+
+
+def fill_behind(img, alpha, sigma=20.0, scale=0.25):
+    """Guess what is behind the subject and paint it over them.
+
+    Every plate in the blur modes is built from the camera frame, so it carries
+    the subject too. Slide that plate and their ghost slides with it, one soft
+    silhouette next to the sharp one. A normalised blur — the frame weighted by
+    "not subject", divided by the same weights blurred — spreads the surrounding
+    wall across the hole instead. It is only ever seen out of focus and behind a
+    person, so a real inpainting model would be wasted here.
+    """
+    h, w = img.shape[-2:]
+    small = F.interpolate(img, scale_factor=scale, mode="bilinear", align_corners=False)
+    keep = 1.0 - F.interpolate(alpha, size=small.shape[-2:], mode="bilinear",
+                               align_corners=False)
+    filled = separable_blur(small * keep, sigma * scale) / \
+        separable_blur(keep, sigma * scale).clamp(min=1e-3)
+    filled = F.interpolate(filled, size=(h, w), mode="bilinear", align_corners=False)
+    return img * (1.0 - alpha) + filled * alpha
+
+
+def parallax(img, depth, dx, dy, pivot):
+    """Reproject the frame for a virtual camera move, using the depth map.
+
+    A backward warp: every output pixel samples the source displaced by its own
+    disparity, so near things travel further than far ones and the picture gets
+    real volume from a flat sensor. Whatever sits at `pivot` depth does not move
+    at all, which is why the pivot belongs on the subject: the face stays nailed
+    in place while the room slides behind it.
+
+    Disocclusion is left to the sampler. Holes only open where the shift exceeds
+    the depth edge it crosses, so keep the amplitude to a few percent of the
+    frame and nobody ever sees one.
+    """
+    h, w = img.shape[-2:]
+    ys, xs = torch.meshgrid(
+        torch.linspace(-1, 1, h, device=img.device, dtype=img.dtype),
+        torch.linspace(-1, 1, w, device=img.device, dtype=img.dtype),
+        indexing="ij")
+    disp = depth[:, 0] - pivot                          # [N,H,W], 0 at the pivot
+    grid = torch.stack((xs + dx * disp, ys + dy * disp), dim=-1)
+    # align_corners=True is what makes linspace(-1, 1) the identity grid: with
+    # False the same grid resamples a half pixel off and softens a still frame.
+    return F.grid_sample(img, grid, mode="bilinear", padding_mode="border",
+                         align_corners=True)
+
+
+def subject_box(alpha, threshold=0.5):
+    """Tightest box around the matte as (x0, y0, x1, y1) in 0..1, or None.
+
+    One `any` per axis rather than a full nonzero: the reduction stays on the
+    GPU and only four numbers cross back to the CPU.
+    """
+    mask = alpha[0, 0] > threshold
+    rows, cols = mask.any(1), mask.any(0)
+    if not bool(rows.any()):
+        return None
+    h, w = mask.shape
+    ys = rows.nonzero()
+    xs = cols.nonzero()
+    return (xs[0].item() / w, ys[0].item() / h,
+            (xs[-1].item() + 1) / w, (ys[-1].item() + 1) / h)
+
+
+class AutoFramer:
+    """Crop and zoom that follows the subject.
+
+    The matte already knows where the person is, so this needs no tracker and no
+    second model: a bounding box, an eased crop and one resize back to full size.
+
+    Everything difficult is the damping. A crop that tracks the box frame by
+    frame breathes with you and reads as a nervous operator, so the target only
+    counts once it has left a dead zone, and the crop then eases towards it a
+    fraction at a time. Standing still, the picture is perfectly still.
+    """
+
+    # Room around the subject, as a fraction of its size: a head cropped at the
+    # hairline is worse framing than no framing at all.
+    MARGIN = 0.55
+    # Kept clear above the head, as a fraction of the crop. A webcam subject
+    # runs from the hairline to the bottom edge of the frame, so it is usually
+    # taller than the crop: centring on it slices the head off, and the top of
+    # the box is the part worth keeping.
+    HEADROOM = 0.08
+    # How far the target may drift, in frame widths, before the crop follows,
+    # and how much of the remaining distance is closed each frame.
+    DEADZONE, SPEED = 0.04, 0.06
+
+    def __init__(self):
+        self.box = None     # the crop currently shown, (cx, cy, w, h) in 0..1
+
+    def reset(self):
+        """Forget the crop, so switching back on reframes from what is there now."""
+        self.box = None
+
+    def target(self, subject, aspect, zoom):
+        """Where the crop wants to be for this subject box."""
+        x0, y0, x1, y1 = subject
+        w = (x1 - x0) * (1 + self.MARGIN)
+        h = (y1 - y0) * (1 + self.MARGIN)
+        # Widen to the output aspect rather than squeezing the picture into it.
+        w = min(max(w, h * aspect, 1.0 / max(zoom, 1.0)), 1.0)
+        h = min(w / aspect, 1.0)
+        w = h * aspect
+        cx = min(max((x0 + x1) / 2, w / 2), 1 - w / 2)
+        cy = min((y0 + y1) / 2, y0 + h / 2 - self.HEADROOM * h)
+        cy = min(max(cy, h / 2), 1 - h / 2)
+        return (cx, cy, w, h)
+
+    def advance(self, subject, aspect, zoom):
+        """Step the crop one frame towards the subject. Returns the crop to use."""
+        if subject is None:
+            return self.box     # nobody in shot: hold the last framing
+        want = self.target(subject, aspect, zoom)
+        if self.box is None:
+            self.box = want
+        elif max(abs(a - b) for a, b in zip(want, self.box)) > self.DEADZONE:
+            self.box = tuple(b + (a - b) * self.SPEED for a, b in zip(want, self.box))
+        return self.box
+
+    def apply(self, img, alpha, zoom):
+        """Reframe `img` on the subject in `alpha`. Both are [1,3|1,H,W]."""
+        h, w = img.shape[-2:]
+        box = self.advance(subject_box(alpha), w / h, zoom)
+        if box is None:
+            return img
+        cx, cy, bw, bh = box
+        x0 = min(max(int((cx - bw / 2) * w), 0), w - 8)
+        y0 = min(max(int((cy - bh / 2) * h), 0), h - 8)
+        x1 = min(max(int((cx + bw / 2) * w), x0 + 8), w)
+        y1 = min(max(int((cy + bh / 2) * h), y0 + 8), h)
+        if (x1 - x0, y1 - y0) == (w, h):
+            return img          # full frame: the resize would only cost softness
+        return F.interpolate(img[:, :, y0:y1, x0:x1], size=(h, w),
+                             mode="bilinear", align_corners=False)

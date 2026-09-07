@@ -9,16 +9,49 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import control  # noqa: E402
+import history  # noqa: E402
+
+
+def desktop_spec(target):
+    """`window HDMI-4` names a screen; `window inbox` names a window title."""
+    return target == "desktop" or target.startswith("desktop:")
+
+
+def pick(target):
+    """@2 means the second entry of `aicamctl history`."""
+    if not target.startswith("@"):
+        return target
+    try:
+        return history.pick(int(target[1:]))
+    except ValueError as exc:
+        sys.exit(f"aicamctl: {exc}")
 
 
 def main():
     p = argparse.ArgumentParser(description="control a running aicam")
     p.add_argument("command", nargs="?", default="state",
                    help="a scene name (confetti, hearts, fireworks, balloons, rain), "
-                        "'state', 'clear', or 'set'")
-    p.add_argument("args", nargs="*", help="for 'set': key=value pairs")
+                        "'state', 'clear', 'set', 'overlay', 'background', "
+                        "'preview [off]', 'mute [off]', 'mirror [off]', "
+                        "'gestures [off]', 'auto_frame [off]', "
+                        "'window <title|off>', "
+                        "'stop' or 'history'")
+    p.add_argument("args", nargs="*",
+                   help="for 'set': key=value pairs. For 'overlay' and 'background': "
+                        "a file, a URL, yt:<youtube url>, '@2' from the history, "
+                        "or 'off'. For 'background' also desktop, desktop:HDMI-4, "
+                        "desktop:left, desktop:window:<title>")
+    p.add_argument("--layer", choices=["front", "back"],
+                   help="overlay: front of you, or behind you in the background")
+    p.add_argument("--mode", choices=["luma", "chroma"], default="luma",
+                   help="overlay: luma = bright-on-black footage; chroma = green screen")
     p.add_argument("--socket", default=None)
     a = p.parse_args()
+
+    if a.command == "history":
+        for i, entry in enumerate(history.load(), start=1):
+            print(f"{i:2}  {entry['kind']:8}  {entry['source']}")
+        return
 
     if a.command == "state":
         msg = {"query": "state"}
@@ -33,6 +66,27 @@ def main():
             except ValueError:
                 values[k] = v
         msg = {"set": values}
+    elif a.command == "overlay":
+        if not a.args:
+            # No file: just move the clip that is already playing.
+            if not a.layer:
+                sys.exit("aicamctl: overlay needs a file, 'off', or --layer")
+            msg = {"overlay_layer": a.layer}
+        else:
+            msg = {"overlay": control.normalise_source(pick(a.args[0])),
+                   "overlay_mode": a.mode, "overlay_layer": a.layer or "front"}
+    elif a.command == "background":
+        if not a.args:
+            sys.exit("aicamctl: background needs a file, a desktop spec, or 'off'")
+        msg = {"background": control.normalise_source(pick(a.args[0]))}
+    elif a.command in ("preview", "mute", "mirror", "gestures", "auto_frame", "stop"):
+        on = not a.args or a.args[0] not in ("off", "0", "false")
+        msg = {"quit": True} if a.command == "stop" else {a.command: on}
+    elif a.command == "window":
+        # No argument means drop whatever is held.
+        target = a.args[0] if a.args else "off"
+        msg = {"window": None if target == "off" else
+               (target if desktop_spec(target) else f"desktop:window:{target}")}
     elif a.command == "clear":
         msg = {"clear": True}
     else:

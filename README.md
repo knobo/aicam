@@ -91,6 +91,66 @@ too much area: it floods and turns white. Try `--highlights 0.8` in the evening.
 ./aicam --mode cinematic --background backgrounds/studio.jpg
 ```
 
+`--background` also takes a video file, which then loops behind you:
+
+```sh
+./aicam --mode cinematic --background clips/beach.mp4
+```
+
+Image or video is settled by trying to decode the file, not by its extension.
+Either one is cropped to cover the frame rather than stretched.
+
+### A stream as the background
+
+`--background` also takes a URL, because the decoder underneath speaks HTTP:
+
+```sh
+./aicam --background "$(yt-dlp -g -f 'bv[vcodec^=avc1][height<=720]' "$URL" | tail -1)"
+```
+
+Measured against a YouTube stream: 447 frames pulled straight into the pipeline
+at 1080p. Two things decide whether this works:
+
+- **Ask for H.264.** `bv[vcodec^=avc1]` is not decoration. Left to itself yt-dlp
+  picks AV1, which this ffmpeg build cannot decode - you get a black background
+  and megabytes of `Missing Sequence Header` on stderr.
+- **The link expires**, six hours in the measured case. A background that loops
+  reopens the stream, and after expiry that fails. For anything that should run
+  quietly behind you all day, download the clip once and point at the file.
+
+Ubuntu's `yt-dlp` is pinned at 2024.04.09 and no longer works against YouTube.
+`pipx install yt-dlp` puts a current one in `~/.local/bin`, which comes first in
+PATH.
+
+For live viewing, capturing the screen it plays on is usually the better trade:
+no extraction, no expiry, and you keep play, pause and seek.
+
+### Your screen as the background
+
+```sh
+./aicam --background desktop:left            # one monitor, by position
+./aicam --background desktop:HDMI-4          # or by its xrandr name
+./aicam --background desktop                 # every monitor, side by side
+./aicam --background desktop:window:youtube  # one window, matched on its title
+```
+
+Put a video fullscreen on the other monitor and you are standing in front of it,
+occluded by depth like everything else here. `./gui.py` has a **Screen or
+window…** menu listing the monitors and every visible window, so you can switch
+while a call is running.
+
+ffmpeg's `x11grab` does the capture and scales it before the frames reach us —
+raw 4K in bgr24 is 745 MB/s, and 1080p is 186 MB/s. Time to the first frame is
+about 0.2 s, measured across all three of the forms above.
+
+Three things worth knowing:
+
+- **X11 only.** On Wayland, capture goes through the desktop portal and
+  PipeWire; aicam says so rather than handing you a black rectangle.
+- **No sound.** This is a picture of your screen. Share the audio separately.
+- **Do not capture the screen showing `--preview`** unless you want the infinite
+  mirror. Grab the other monitor.
+
 In blur mode `--background` replaces everything outside the matte, so a book you
 hold up vanishes the moment segmentation stops counting it as part of you. In
 cinematic mode *depth* decides: everything at or in front of the focus plane is
@@ -106,7 +166,8 @@ Trigger them three ways:
 
 ```sh
 ./aicamctl confetti           # command line
-./gui.py                      # Tk control panel with a button per scene
+./gui.py                      # Tk control panel: a button per scene, sliders
+                              # for the look, and Start/Stop for the pipeline
 ```
 
 ...or with a gesture, if `mediapipe` is installed:
@@ -119,9 +180,103 @@ Trigger them three ways:
 | victory sign | balloons |
 | thumbs down | rain |
 
-A gesture must be held for three consecutive detections before it fires, and the
-same gesture will not fire again for four seconds. Gestures are never reliable
-enough to be the only route, which is why the panel and the CLI exist.
+A gesture must be held *still* for 0.8 s before it fires (`--gesture-hold`), and
+the same gesture will not fire again for four seconds. Both halves matter:
+scratching your head runs a hand through victory, thumbs-up and open-palm on the
+way, each for a tenth of a second, so counting detections alone sets off balloons
+every time you have an itch. The wrist has to stay within 6% of the frame width
+while the count runs. A hand over your own face is
+ignored - a fist under the chin is a thumbs-up and glasses pushed up are a
+victory, and neither was meant for the camera (`--no-gesture-face-guard` to turn
+that off). Gestures are never reliable enough to be the only route, which is why
+the panel and the CLI exist; the panel's *Gestures* checkbox, or `aicamctl
+gestures off`, silences them without stopping hand tracking, so pinch-dragging a
+held window still works.
+
+### Auto-framing
+
+```sh
+./aicam --auto-frame --frame-zoom 2.0
+```
+
+Crops and zooms to follow you around the frame. The matte already knows where
+you are, so this costs a bounding box and one resize - no tracker, no second
+model, and 30 fps is unchanged.
+
+The crop keeps the top of the box rather than its centre: a webcam subject runs
+from the hairline to the bottom edge, and centring on that slices the head off.
+It moves only once you have left a dead zone and then eases, so breathing is not
+a camera move. `--frame-zoom` caps how far in it may go, and the panel has an
+*Auto-frame* checkbox and a zoom slider (`aicamctl auto_frame off`, `aicamctl set
+frame_zoom=1.4`).
+
+### Parallax: a 3D camera out of a flat webcam
+
+```sh
+./aicam --parallax 3            # percent of frame width
+./aicam --parallax 3 --parallax-period 8
+```
+
+Every competing product has a matte — foreground, background, flat. This has a
+depth map, and a depth map is enough to move the camera. Each output pixel is
+sampled from the source displaced by its own disparity, so near things travel
+further than far ones and a flat sensor gets real volume. The pivot is your own
+median depth, which is the detail that sells it: your face stays nailed in place
+while the room slides behind it, the way a camera on a dolly looks and not the
+way a wobbling filter looks.
+
+Cost is 0.35 ms/frame at 1080p. Keep the amplitude at 2-4%; that is where the
+disocclusion holes stay smaller than the depth edges they open behind.
+
+The plate is inpainted before it moves (`fill_behind`, 0.70 ms, only while
+parallax is on). Without that, the plate carries a blurred copy of you, slides
+it sideways, and leaves one soft silhouette next to the sharp one.
+
+### Holding a window in the frame
+
+```sh
+./aicamctl window inbox         # matched on the window title
+./aicamctl window off
+```
+
+The panel's **Hold a window…** menu lists the same monitors and windows as the
+background menu. The window is composited into the plate *behind* the subject,
+so you pass in front of it and it reads as held rather than pasted on top of
+you.
+
+With `mediapipe` installed you can also pinch: hold thumb and index together for
+a third of a second and the panel comes to your hand and follows it; open your
+fingers to drop it. Pinching with no panel open pulls out whatever screen is
+already the background, so the trick needs no setup. Any deliberate pinch takes
+the panel wherever it is — making you find a rectangle with your fingertips is a
+game, not a feature.
+
+A pinch is judged on fingertip gap over hand size, tighter than 0.22 to grab and
+looser than 0.42 to release. A hand resting on a keyboard measures around 0.4
+with the fingers curled, which is why the number is not higher: the panel used
+to pull itself out of the screen unasked. `state` reports `pinch_gap` live, so
+`--pinch` can be tuned against your own hand rather than guessed.
+
+### Mirror, mute and auto-frame
+
+```sh
+./aicam --mirror                # reaching right moves right on screen
+./aicam --auto-frame            # crop and zoom to follow you around
+./aicamctl mute                 # show only the background, not the camera
+```
+
+**Mirror** flips the camera frame the moment it is read, before matting, depth
+and hand tracking see it, so all of them work in the same coordinates as the
+output. Backgrounds and held windows are composited later and stay unflipped —
+otherwise every letter in them would come out backwards.
+
+**Mute** is a camera mute rather than a pause: the background keeps playing and
+you disappear from it. The matte is still computed, so unmuting is instant.
+Without a background you get black.
+
+**Auto-frame** crops and zooms to follow you, applied last of all so the
+particles, the overlay and a held window are carried by the same camera move.
+`--frame-zoom` bounds how far in it may crop.
 
 ### Video overlays
 
@@ -133,6 +288,17 @@ enough to be the only route, which is why the panel and the CLI exist.
 or smoke on black, which composites additively with nothing to cut out. `chroma`
 keys out a green or blue screen. The GUI has a file picker for both.
 
+A clip sits in front of you by default. `--overlay-layer back` mixes it into the
+background instead, before you are composited on top:
+
+```sh
+./aicam --overlay confetti.mp4 --overlay-mode chroma --overlay-layer back
+```
+
+Behind means behind *you*, not behind everything: particles that spawn between
+you and the background still pass in front of the clip. A green-screened crowd
+belongs at the back; sparks that should drift past your face belong in front.
+
 ### Control socket
 
 Everything is reachable at runtime over a unix socket:
@@ -142,6 +308,39 @@ Everything is reachable at runtime over a unix socket:
 ./aicamctl fireworks
 ./aicamctl set aperture=70 light=0.4
 ./aicamctl clear
+
+./aicamctl overlay sparks.mp4 --mode luma --layer back
+./aicamctl overlay --layer front      # moves the running clip, no restart
+./aicamctl overlay off
+./aicamctl background clips/beach.mp4
+./aicamctl background desktop:right
+./aicamctl background off
+
+./aicamctl window inbox               # hold a window in the frame
+./aicamctl mirror / mute / preview    # each takes a trailing 'off'
+./aicamctl gestures off               # stop reactions, keep hand tracking
+./aicamctl auto_frame
+./aicamctl stop                       # shut the pipeline down cleanly
+```
+
+Overlay, its layer and the background can all be swapped while the pipeline is
+running; the GUI has controls for each. Moving a clip between layers keeps it
+playing where it was rather than restarting it.
+
+`stop` is the right way to end a run. aicam closes its ffmpeg by letting it see
+EOF, then SIGTERM, and only then gives up — a killed ffmpeg is what leaves
+v4l2loopback wedged for the next run. The panel's **Start/Stop** button goes
+through the same socket, and aicam refuses to start beside a running instance,
+because two writers on one loopback device is exactly what wedges it.
+
+## Tests
+
+The keying, layer and background plumbing runs on the CPU, so it is testable
+without a camera, a GPU or a loopback device. The clips are generated with
+ffmpeg, so there are no binary fixtures in the repository.
+
+```sh
+.venv/bin/python -m pytest tests -q
 ```
 
 ## Performance

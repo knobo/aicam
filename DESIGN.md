@@ -82,15 +82,43 @@ at its own pixel:
 
 Particles are rasterised into two layers and composited in order:
 
-    background -> particles behind -> subject -> particles in front
+    background -> overlay (back) -> particles behind -> subject
+               -> particles in front -> overlay (front)
 
-so confetti passes behind your shoulder and is occluded by it. Each scene
+so confetti passes behind your shoulder and is occluded by it. A video overlay
+picks one of the two ends of that chain: `front` pastes it over the finished
+frame, `back` mixes it into the background before you are composited, so you
+cover it while particles between you and the wall still pass in front of it.
+There is deliberately no slot for it *between* the particle layers - a clip is
+flat footage with no depth of its own, so the only honest choices are all the
+way in front or all the way behind. Each scene
 spreads its particles in z *around the subject's own depth*, which is what makes
 some go in front and some behind. A scene where every particle shares one z
 looks like a sticker.
 
 Rendering is one `grid_sample` per particle for rotation and scale, then a
 `scatter_add` splat into the frame. 1.2 ms for a few hundred particles at 1080p.
+
+## The screen as a background
+
+A monitor or a window is captured with ffmpeg's `x11grab` and read as raw frames
+off a pipe, which is the same shape as the video decoder: a thread fills a small
+queue, the render loop never waits on I/O.
+
+The scaling is the whole design decision. Raw 4K in bgr24 is 745 MB/s down the
+pipe; asking ffmpeg for the render size instead makes it 186 MB/s at 1080p, and
+the resampling happens in the process that already has the frame. Measured time
+to the first frame is around 0.2 s whether the grab is one 1680x1050 monitor or
+the full 5520x2160 desktop.
+
+Window grabs use `-window_id`, so the capture follows the window as it moves. A
+resize changes the frame format and ends the grab; the reader notices the short
+read, re-resolves the window's geometry and respawns. You get a hiccup rather
+than a dead background.
+
+X11 only, deliberately. Wayland routes screen capture through the desktop portal
+and PipeWire, which is a different mechanism rather than a different flag, and
+guessing at it would produce a black rectangle with no explanation.
 
 ## Background replacement that understands depth
 
@@ -217,7 +245,13 @@ the CUDA provider cannot load regardless of what the GUI offers. Verified with
 It is worth keeping installed as a fallback, and it has four low-light models
 (`zero_dce`, `uretinex_net`, `tbefn`, `semantic_guided_llie`) that aicam does not.
 
+**Auto-framing off the matte.** A face tracker would be a third model in a
+budget that has six spare milliseconds. The alpha channel already carries the
+subject's outline every frame, so the bounding box is a reduction on data that
+has been paid for, and the framing is one crop and one resize. Measured: 30 fps
+with it on, the same as with it off.
+
 ## Where there is room left
 
 At 30 fps roughly 27 of 33 ms are used with everything on. Still unbuilt:
-auto-framing, low-light denoising, background stylisation, gaze correction.
+low-light denoising, background stylisation, gaze correction.

@@ -113,3 +113,33 @@ def send(message, path=None, timeout=2.0):
             return json.loads(s.recv(65536).decode("utf-8") or "{}")
         except (socket.timeout, json.JSONDecodeError):
             return {}
+
+
+def normalise_source(target):
+    """Turn a command line background or overlay argument into what aicam wants.
+
+    aicam runs in its own working directory, so a relative path has to be made
+    absolute here. A URL and a desktop spec are names rather than paths, and
+    abspath would mangle both of them into nonsense.
+    """
+    if target == "off":
+        return None
+    if "://" in target or target.startswith("desktop"):
+        return target
+    return os.path.abspath(target)
+
+
+def spec_for_url(text):
+    """Turn a pasted link into a background spec.
+
+    A YouTube page URL has to go through yt-dlp, so it is prefixed; a direct
+    link to a media file is already something the decoder can open.
+    """
+    url = text.strip()
+    if url.startswith("yt:"):
+        return url
+    host = url.split("/")[2].lower() if "://" in url and len(url.split("/")) > 2 else ""
+    if host.endswith("youtube.com") or host.endswith("youtu.be") or \
+            host.endswith("youtube-nocookie.com"):
+        return f"yt:{url}"
+    return url
