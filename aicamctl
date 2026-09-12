@@ -6,10 +6,16 @@ import json
 import os
 import sys
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 import control  # noqa: E402
 import history  # noqa: E402
+
+
+# Mirrors drawing.TOOLS and drawing.PALETTE. Deliberately not imported: this
+# command has to answer instantly, and importing drawing brings torch with it.
+TOOLS = ("pen", "laser", "line", "rect", "eraser")
+INKS = ("white", "yellow", "pink", "cyan", "green", "orange")
 
 
 def desktop_spec(target):
@@ -34,6 +40,8 @@ def main():
                         "'state', 'clear', 'set', 'overlay', 'background', "
                         "'preview [off]', 'mute [off]', 'mirror [off]', "
                         "'gestures [off]', 'auto_frame [off]', "
+                        "'draw [off]', 'tool <name>', 'ink <colour>', "
+                        "'undo', 'erase', "
                         "'window <title|off>', "
                         "'stop' or 'history'")
     p.add_argument("args", nargs="*",
@@ -79,7 +87,18 @@ def main():
         if not a.args:
             sys.exit("aicamctl: background needs a file, a desktop spec, or 'off'")
         msg = {"background": control.normalise_source(pick(a.args[0]))}
-    elif a.command in ("preview", "mute", "mirror", "gestures", "auto_frame", "stop"):
+    elif a.command == "tool":
+        if not a.args or a.args[0] not in TOOLS:
+            sys.exit(f"aicamctl: tool needs one of {', '.join(TOOLS)}")
+        msg = {"tool": a.args[0]}
+    elif a.command == "ink":
+        if not a.args or a.args[0] not in INKS:
+            sys.exit(f"aicamctl: ink needs one of {', '.join(INKS)}")
+        msg = {"ink": a.args[0]}
+    elif a.command in ("undo", "erase"):
+        msg = {a.command: True}
+    elif a.command in ("preview", "mute", "mirror", "gestures", "auto_frame",
+                       "draw", "stop"):
         on = not a.args or a.args[0] not in ("off", "0", "false")
         msg = {"quit": True} if a.command == "stop" else {a.command: on}
     elif a.command == "window":

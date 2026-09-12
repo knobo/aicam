@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#2c3648"/>
+      <stop offset="1" stop-color="#151a23"/>
+    </linearGradient>
+    <radialGradient id="glass" cx=".35" cy=".3" r=".85">
+      <stop offset="0" stop-color="#6fe0d0"/>
+      <stop offset="1" stop-color="#146b7c"/>
+    </radialGradient>
+  </defs>
+
+  <rect x="4" y="4" width="120" height="120" rx="27" fill="url(#bg)"/>
+
+  <!-- out-of-focus highlights: the background sits behind the subject -->
+  <circle cx="33" cy="33" r="14" fill="#7fd1ff" opacity=".33"/>
+  <circle cx="95" cy="28" r="10" fill="#ffd27f" opacity=".30"/>
+  <circle cx="104" cy="50" r="6.5" fill="#ff9ec4" opacity=".28"/>
+  <circle cx="62" cy="24" r="5" fill="#b6ff9e" opacity=".22"/>
+
+  <!-- camera body, in focus -->
+  <path d="M45 41h20l6 9H45z" fill="#dde5f0"/>
+  <rect x="15" y="50" width="98" height="58" rx="14" fill="#e8eef7"/>
+  <circle cx="64" cy="79" r="23" fill="#0f1720"/>
+  <circle cx="64" cy="79" r="18" fill="url(#glass)"/>
+  <circle cx="57" cy="72" r="5.5" fill="#ffffff" opacity=".55"/>
+  <circle cx="99" cy="61" r="4" fill="#ff6b6b"/>
+</svg>

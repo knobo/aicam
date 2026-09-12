@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Launcher: prefer the project venv, which is where mediapipe lives.
+# readlink first, so a symlink in ~/.local/bin still finds aicam.py.
 set -euo pipefail
-here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 python="$here/.venv/bin/python"
 [ -x "$python" ] || python="$(command -v python3)"
 exec "$python" "$here/aicam.py" "$@"

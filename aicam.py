@@ -23,10 +23,11 @@ import numpy as np
 import torch
 
 # Run via shebang from any directory, so our own modules must be found explicitly.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 import control  # noqa: E402
 import desktop  # noqa: E402
+import drawing  # noqa: E402
 import effects  # noqa: E402
 import history  # noqa: E402
 import overlays  # noqa: E402
@@ -35,9 +36,9 @@ from control import ControlServer  # noqa: E402
 from depth import DepthEstimator  # noqa: E402
 from scenes import SCENES  # noqa: E402
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(os.path.realpath(__file__))
 TUNABLE = {"aperture", "light", "rim", "highlights", "blur", "keep_near", "downsample",
-           "parallax", "parallax_period", "frame_zoom"}
+           "parallax", "parallax_period", "frame_zoom", "ink_width"}
 
 
 # ---------------------------------------------------------------- input and output
@@ -242,6 +243,13 @@ def build_parser():
                    help="flip the camera left to right, so reaching right moves "
                         "right on screen; backgrounds and held windows are not "
                         "flipped, so text in them stays readable")
+    p.add_argument("--ink", default=drawing.DEFAULT_INK, choices=sorted(drawing.PALETTE),
+                   help="colour of air-drawn strokes")
+    p.add_argument("--tool", default=drawing.DEFAULT_TOOL, choices=list(drawing.TOOLS),
+                   help="what a pinch does while drawing: pen, laser, line, "
+                        "rect or eraser")
+    p.add_argument("--ink-width", type=float, default=7.0, metavar="PX",
+                   help="thickness of air-drawn strokes")
     p.add_argument("--pinch", type=float, default=None, metavar="RATIO",
                    help="how tight a pinch has to be, as fingertip gap over hand "
                         "size; watch `pinch_gap` in aicamctl state to tune it")
@@ -344,6 +352,10 @@ def main():
         print(f"aicam: control socket at {server.path}", file=sys.stderr)
 
     pool = particles.ParticleSystem(device, capacity=args.particles)
+    canvas = drawing.Canvas(device)
+    draw_mode = False
+    ink = args.ink
+    tool = args.tool
     active = []
     overlay = None
     if args.overlay:
@@ -471,6 +483,24 @@ def main():
                         if msg.get("clear"):
                             active.clear()
                             pool.alive[:] = False
+                        if "draw" in msg:
+                            draw_mode = bool(msg["draw"]) and detector is not None
+                            if msg["draw"] and detector is None:
+                                print("aicam: nothing to draw with - hand tracking "
+                                      "is off (needs mediapipe and --gestures)",
+                                      file=sys.stderr)
+                            if not draw_mode:
+                                canvas.end()
+                        if "ink" in msg and msg["ink"] in drawing.PALETTE:
+                            ink = msg["ink"]
+                            canvas.end()      # a colour change starts a new stroke
+                        if "tool" in msg and msg["tool"] in drawing.TOOLS:
+                            tool = msg["tool"]
+                            canvas.end()
+                        if msg.get("erase"):
+                            canvas.clear()
+                        if msg.get("undo"):
+                            canvas.undo()
                         if "set" in msg:
                             for k, v in msg["set"].items():
                                 if k in TUNABLE:
@@ -500,7 +530,7 @@ def main():
                 # is already the background, so the trick needs no setup at all.
                 pointer = detector.pointer if detector is not None else None
                 pinching = bool(pointer and pointer[2])
-                if pinching and not was_pinching:
+                if pinching and not was_pinching and not draw_mode:
                     # Any deliberate pinch takes the panel, wherever it is: making
                     # the user find a rectangle with their fingertips is a game,
                     # not a feature. The smoothing turns the jump into a glide.
@@ -515,7 +545,7 @@ def main():
                             panel.held = True
                         except (ValueError, RuntimeError) as exc:
                             print(f"aicam: {exc}", file=sys.stderr)
-                elif not pinching and panel is not None:
+                elif not pinching and panel is not None and not draw_mode:
                     panel.held = False
                 was_pinching = pinching
 
@@ -527,6 +557,20 @@ def main():
 
                 fgr, pha, *rec = matting(src, *rec, downsample_ratio=settings["downsample"])
                 d = depth_model(src)
+
+                # Ink goes down here and nowhere else: this is the one point in
+                # the frame where the depth map exists, and every point of a
+                # stroke has to keep the depth of the fingertip that drew it.
+                # Ages the laser whether or not a hand is in shot: ink that
+                # fades has to keep fading while you go back to talking.
+                canvas.update(now)
+                if draw_mode:
+                    if pointer is not None and pointer[2]:
+                        canvas.begin(tool)
+                        canvas.extend(pointer[0], pointer[1], d,
+                                      colour=ink, width=settings["ink_width"])
+                    else:
+                        canvas.end()
 
                 # A video background hands over a new frame here; a still one hands
                 # back the same tensor every time.
@@ -612,6 +656,12 @@ def main():
                 pool.update(dt)
 
                 front, behind = pool.render(height, width, scene_depth=d)
+                if not canvas.empty:
+                    # Same two layers as the particles, so the ink is occluded by
+                    # the same rule and needs no compositing step of its own.
+                    ink_front, ink_behind = canvas.render(height, width, scene_depth=d)
+                    front = drawing.over(ink_front, front)
+                    behind = drawing.over(ink_behind, behind)
                 out = particles.composite(base, subject, subject_alpha, front, behind)
 
                 if clip_layer == "front":
@@ -664,6 +714,10 @@ def main():
                             "gestures": gestures_on,
                             "auto_frame": auto_frame,
                             "window": panel.label if panel else None,
+                            "draw": draw_mode,
+                            "ink": ink,
+                            "tool": tool,
+                            "ink_points": canvas.count,
                             "pinch": pinching,
                             "pinch_gap": detector.pinch_gap if detector else None,
                             "scenes": [s.name for s in active],

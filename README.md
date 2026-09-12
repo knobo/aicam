@@ -10,14 +10,45 @@ by your shoulder** while confetti falls in front. Same reason a book you hold up
 stays sharp when the background is blurred: it is nearer than the focus plane,
 and the pipeline knows that.
 
+Your webcam goes in, a second camera device comes out, and everything in
+between is a depth map:
+
+```mermaid
+flowchart LR
+    cam["/dev/video0<br/>your webcam · 1080p MJPG"]
+
+    subgraph gpu ["every frame, on the GPU"]
+        direction TB
+        matte["matting<br/>RobustVideoMatting"]
+        depth["depth<br/>MiDaS"]
+        look["depth-graded bokeh<br/>studio light · parallax"]
+        comp["composite by z"]
+        matte --> look
+        depth --> look
+        look --> comp
+
+        stuff["particles · ink · overlays<br/>each with a z"]
+        stuff --> comp
+    end
+
+    hands["hand tracking<br/>MediaPipe, CPU, off-thread"]
+    cam --> matte
+    cam --> depth
+    hands -.-> stuff
+    comp --> out["/dev/video10<br/>AI Cam · v4l2loopback"]
+    out --> apps["Teams · Meet · Zoom"]
 ```
-/dev/video0              aicam                              /dev/video10
-your webcam         ->   matting + depth on CUDA        ->   "AI Cam"    -> browser -> Teams
-1920x1080 MJPG           depth-graded bokeh                  v4l2loopback
-                         particles with a z coordinate
-                         video overlays
-                         hand gestures (CPU, off-thread)
-```
+
+What it does, in one list:
+
+- **Reactions that respect depth** - confetti in front of you, fireworks behind
+  your shoulder
+- **Cinematic mode** - depth-graded bokeh and studio lighting, not a flat blur
+- **Background replacement** that still lets through whatever you hold up
+- **Your screen, a window, a video or a YouTube link** as the background
+- **Draw in the air** with your finger, and the ink keeps the depth you drew it at
+- **Hand gestures** to fire any of it, plus a Tk panel and a CLI for when they misfire
+- **Auto-framing** and a virtual camera move, from one still camera
 
 ## Requirements
 
@@ -55,6 +86,25 @@ sudo modprobe v4l2loopback
 `exclusive_caps=1` is required. Without it the device advertises itself as both
 input and output at once, and Chrome refuses to list it.
 
+### Desktop entry
+
+```sh
+./install.sh               # menu entry + icon, launchers in ~/.local/bin
+./install.sh --service     # ...and a systemd --user unit, off by default
+./install.sh --uninstall
+```
+
+**aicam** then shows up in the application menu and opens the control panel,
+with a Start button for the pipeline itself. Nothing is copied: the venv, the
+weights and the backgrounds stay in the checkout and everything installed points
+back at it, so `git pull` is the whole upgrade. `aicam`, `aicam-gui` and
+`aicamctl` become symlinks in `~/.local/bin`, which is why the scripts resolve
+their own path with `readlink` before looking for their siblings.
+
+The panel sets its Tk `className`, so the window reports `WM_CLASS = "aicam"`
+and the shell can pair it with the desktop entry; without that Tk calls itself
+`Tk` and the window gets a generic icon.
+
 ## Use
 
 ```sh
@@ -67,6 +117,13 @@ input and output at once, and Chrome refuses to list it.
 Then pick **AI Cam** as your camera. The real camera must be free when aicam
 starts; Chrome does not release `/dev/video0` until every tab that used it is
 closed.
+
+The panel opens as tall as it needs, or as tall as the monitor it lands on,
+whichever is less - and scrolls when it is the latter. On a multi-head X11
+session that means the monitor it is actually on, not the two of them added
+together, which is what Tk will tell you if you ask it. The wheel scrolls from
+anywhere on the panel, dropdowns included: ttk would otherwise let a scroll past
+the Tool list quietly change your tool.
 
 ### Cinematic mode
 
@@ -100,6 +157,25 @@ too much area: it floods and turns white. Try `--highlights 0.8` in the evening.
 Image or video is settled by trying to decode the file, not by its extension.
 Either one is cropped to cover the frame rather than stretched.
 
+`backgrounds/` ships with five: `studio` and `studio-warm` (softbox vignettes,
+cool and warm), `dusk`, `bokeh-night` and `paper` for anyone the dark ones turn
+into a silhouette. They are rendered by `./make-backgrounds.py` rather than
+photographed - nothing to license, ~50 kB each, and a background whose job is to
+sit still behind a face is better off not being a photograph of an office. Edit
+that script and re-run it to change the set.
+
+In the panel, **Bundled…** drops down whatever is in `backgrounds/` — what ships
+with aicam plus anything you have put there since — so the usual case is one
+click and no dialog at all. Its last entry opens the folder in your file
+manager, which is where you add more.
+
+**Image/video…** is for everything else, and it posts the desktop's own file
+chooser: `zenity` under GNOME, `kdialog` under KDE. Tk's dialog has no
+bookmarks, no thumbnails and no recent files, so it is only the fallback for a
+desktop that ships neither. The chooser is a child process polled from the Tk
+loop rather than waited on, so fps keeps ticking and Start/Stop keeps working
+while it is open.
+
 ### A stream as the background
 
 `--background` also takes a URL, because the decoder underneath speaks HTTP:
@@ -121,6 +197,10 @@ at 1080p. Two things decide whether this works:
 Ubuntu's `yt-dlp` is pinned at 2024.04.09 and no longer works against YouTube.
 `pipx install yt-dlp` puts a current one in `~/.local/bin`, which comes first in
 PATH.
+
+The panel takes the same links in the box under **Stream a URL as the
+background**: a YouTube page URL goes through yt-dlp, anything else is handed to
+the decoder as-is.
 
 For live viewing, capturing the screen it plays on is usually the better trade:
 no extraction, no expiry, and you keep play, pause and seek.
@@ -160,14 +240,26 @@ kept from the real image, and only what lies behind is replaced.
 
 Five scenes: `confetti`, `hearts`, `fireworks`, `balloons`, `rain`. Each spreads
 its particles in z around your own depth, so some pass in front of you and some
-behind.
+behind. That is the whole trick, and it is the order the frame is built in:
+
+```mermaid
+flowchart TB
+    bg["the background<br/>room, image, video or screen"]
+    back["behind you<br/>ink and particles further off"]
+    you["you<br/>the matte"]
+    front["in front of you<br/>ink and particles nearer"]
+    over["the overlay, if one is playing"]
+    out["the frame Teams sees"]
+    bg --> back --> you --> front --> over --> out
+```
 
 Trigger them three ways:
 
 ```sh
 ./aicamctl confetti           # command line
-./gui.py                      # Tk control panel: a button per scene, sliders
+./aicam-gui                   # Tk control panel: a button per scene, sliders
                               # for the look, and Start/Stop for the pipeline
+                              # (the same panel the menu entry opens)
 ```
 
 ...or with a gesture, if `mediapipe` is installed:
@@ -192,6 +284,55 @@ that off). Gestures are never reliable enough to be the only route, which is why
 the panel and the CLI exist; the panel's *Gestures* checkbox, or `aicamctl
 gestures off`, silences them without stopping hand tracking, so pinch-dragging a
 held window still works.
+
+### Drawing in the air
+
+Turn it on, pinch, and move your hand: the ink follows your fingertips.
+
+```sh
+./aicamctl draw                # pinch now draws instead of grabbing a window
+./aicamctl tool eraser         # pen, laser, line, rect, eraser
+./aicamctl ink cyan            # white, yellow, pink, cyan, green, orange
+./aicamctl set ink_width=12
+./aicamctl undo                # one step back, whatever it was
+./aicamctl erase               # wipe the lot (also undoable)
+./aicamctl draw off
+```
+
+The panel has the same under **Draw in the air**, and *Ink width* joins the
+sliders.
+
+| tool | what a pinch does |
+|---|---|
+| `pen` | freehand, and the ink stays until you remove it |
+| `laser` | the same, but it fades out about a second and a half later |
+| `line` | straight, from where you pinched to where you let go |
+| `rect` | a box round the same two corners |
+| `eraser` | rubs out the ink you drag it through |
+
+`line` and `rect` redraw from the anchor while you hold the pinch, so you see
+what you are about to get and can pull it into place before letting go.
+
+The eraser ignores depth on purpose: it takes whatever ink is under your
+fingertip at any distance. One that only took ink at the depth your hand
+happened to be at would leave ghosts of the same stroke hanging a few
+centimetres away, and no amount of waving would clear them.
+
+**Undo goes one step back, whatever that step was** - a stroke, a rub-out, or a
+wipe of the whole canvas. It remembers a dozen of them.
+
+Every point of a stroke keeps the depth of the fingertip that drew it, so the
+ink hangs in the room rather than on the lens. Draw a circle at arm's length,
+then lean into it: your shoulder passes in front of the ink the way it passes in
+front of anything else at that distance. Draw with your hand up by your face and
+the ink stays in front of you, because that is where you put it.
+
+While drawing is on, a pinch no longer grabs a screen or a window - one pinch
+cannot mean two things. Turn it off and the grab comes back.
+
+Drawing needs the hand tracker, so it needs `mediapipe` and `--gestures`; it does
+not need the gesture *triggers*. Switch **Gestures** off and you can draw for as
+long as you like without a stray victory sign setting off balloons.
 
 ### Auto-framing
 
@@ -301,7 +442,19 @@ belongs at the back; sparks that should drift past your face belong in front.
 
 ### Control socket
 
-Everything is reachable at runtime over a unix socket:
+Gestures will never be perfect, so nothing is only reachable by hand. One socket
+serves every front end, and the pipeline deals with one kind of message:
+
+```mermaid
+flowchart LR
+    gui["aicam-gui<br/>the Tk panel"] --> sock
+    cli["aicamctl<br/>the shell"] --> sock
+    sock[["$XDG_RUNTIME_DIR/aicam.sock"]] --> loop["the render loop"]
+    hands["your hands<br/>MediaPipe, on its own thread"] --> loop
+    loop -. state .-> sock
+```
+
+Everything is reachable at runtime over that socket:
 
 ```sh
 ./aicamctl state

@@ -1,0 +1,15 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=aicam
+GenericName=Virtual webcam
+Comment=Depth-aware background effects and reactions for your webcam
+Exec=@EXEC@
+TryExec=@EXEC@
+Path=@HERE@
+Icon=aicam
+Terminal=false
+StartupNotify=true
+StartupWMClass=aicam
+Categories=AudioVideo;Video;Recorder;
+Keywords=webcam;camera;background;blur;bokeh;virtual;v4l2;

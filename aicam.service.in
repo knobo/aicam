@@ -4,7 +4,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=%h/prog/aicam/aicam --input /dev/video0 --output /dev/video10
+ExecStart=@EXEC@ --input /dev/video0 --output /dev/video10
 Restart=on-failure
 RestartSec=5
 

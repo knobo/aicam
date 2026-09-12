@@ -156,6 +156,62 @@ A gesture must be seen on three consecutive detections before it fires, and the
 same gesture cannot fire again within four seconds. Without both, a hand passing
 through a pose on its way somewhere else sets off confetti in a meeting.
 
+## Drawing in the air
+
+The pinch that holds a window already gives a fingertip position every frame, so
+ink costs no new model and no new tracking. What makes it worth building is the
+depth map: each point of a stroke keeps the depth of the fingertip that drew it,
+so the ink hangs in the room rather than on the glass, and you can walk in front
+of it.
+
+Two things had to be right.
+
+**The depth test is per pixel, not per point.** The particles test one depth
+under each sprite's centre, which is invisible for a 6 px confetto. A stroke is
+different: it runs *along* an edge for its whole length, so stamps whose centres
+fall just outside a shoulder would paint several pixels of ink across it. Every
+point lays its own depth into a z-buffer as it is stamped and the front/behind
+split is decided pixel by pixel afterwards. Same cost, no bleed.
+
+**Stamps combine with max, not sum.** A stroke is a dense line of overlapping
+brush marks. Added together, a hand that slowed down burns a bright knot and a
+steady one draws a bar; `scatter_reduce(amax)` gives ink that is opaque and even
+whatever the hand did.
+
+The tracker runs at 10 Hz against a 30 fps loop. Rather than interpolating
+between two tracker samples, the pointer is low-passed every frame and the gap
+between consecutive positions is filled with stamps: the smoothing *is* the
+interpolation, and it doubles as the fix for a fingertip that jitters by a pixel
+or two when a hand is trying to hold still.
+
+**Undo had to become a snapshot.** It started as "drop the last stroke", which
+is the obvious implementation and cannot survive an eraser: the ink a rub-out
+removed is gone, so there is no stroke to drop. Each action now keeps a copy of
+the canvas as it was before it - 0.04 ms and only as large as the ink that
+existed at the time - and one Undo means the same thing whether the last thing
+you did was draw, rub out, or wipe the lot. Wiping being undoable is the part
+that gets used: *Erase all* is the easiest button to hit by mistake.
+
+Measured on the RTX 4070 SUPER at 1080p, with the rest of the pipeline running:
+
+| | ms/frame |
+|---|---:|
+| 1 000 points on the canvas | 0.97 |
+| 5 000 points | 1.08 |
+| 12 000 points | 1.84 |
+| 24 000 points (the cap) | 2.26 |
+| adding to a stroke, per frame while drawing | 0.22 |
+| an eraser sweep over a full canvas | 0.06 |
+| ageing the laser, full canvas of it | 0.34 |
+| ageing when nothing is fading | 0.02 |
+| the undo snapshot, once per stroke | 0.04 |
+
+Nothing is paid when the canvas is empty. A full canvas is 2.3 ms of the 6 ms
+that were left, which is what set the cap: past that the wall is illegible
+anyway, and the oldest stroke is dropped whole rather than trimmed, because
+losing the tail of a scribble looks like a bug and losing the scribble looks
+like a wipe.
+
 ## Measurements
 
 RTX 4070 SUPER, 1080p, `downsample_ratio=0.25`, whole chain including the

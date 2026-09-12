@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Launcher for the Tk control panel. Resolves symlinks first: the desktop entry
+# and ~/.local/bin both point here, and gui.py has to be found next to its
+# siblings in the checkout, not next to the link.
+set -euo pipefail
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+python="$here/.venv/bin/python"
+[ -x "$python" ] || python="$(command -v python3)"
+exec "$python" "$here/gui.py" "$@"
