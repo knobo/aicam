@@ -43,19 +43,75 @@ TUNABLE = {"aperture", "light", "rim", "highlights", "blur", "keep_near", "downs
 
 # ---------------------------------------------------------------- input and output
 
+def is_device(source):
+    """True for /dev/videoN, false for a file or a URL."""
+    return re.fullmatch(r"/dev/video(\d+)", str(source)) is not None
+
+
+class StillCapture:
+    """One image, served as an endless video.
+
+    OpenCV opens an image file happily, hands over exactly one frame, and then
+    cannot seek back to it - so the pipeline would report the camera lost on
+    frame two. A still is the most convenient input there is for a demo or a
+    bug report: nothing to film, nothing to license, and the same frame every
+    run. It gets its own capture rather than a special case in the loop.
+    """
+
+    def __init__(self, path):
+        self.frame = cv2.imread(path)
+        if self.frame is None:
+            raise RuntimeError(f"could not read {path}")
+
+    def isOpened(self):
+        return True
+
+    def read(self):
+        # A copy, because the pipeline is free to write into what it is given.
+        return True, self.frame.copy()
+
+    def get(self, prop):
+        if prop == cv2.CAP_PROP_FRAME_WIDTH:
+            return self.frame.shape[1]
+        if prop == cv2.CAP_PROP_FRAME_HEIGHT:
+            return self.frame.shape[0]
+        return 0
+
+    def set(self, *_args):
+        return False
+
+    def release(self):
+        pass
+
+
+def is_still(path):
+    """An image rather than a clip, decided by asking OpenCV to decode it."""
+    return not is_device(path) and os.path.isfile(path) and cv2.imread(path) is not None
+
+
 def open_camera(device, width, height, fps):
-    # This OpenCV build only accepts an index on the V4L2 backend, not a path.
-    m = re.fullmatch(r"/dev/video(\d+)", device)
-    source = int(m.group(1)) if m else device
-    cap = cv2.VideoCapture(source, cv2.CAP_V4L2)
+    # This OpenCV build only accepts an index on the V4L2 backend, not a path,
+    # and pinning that backend makes it refuse a file outright - it says as much
+    # in a warning and returns a closed capture. So anything that is not a
+    # camera goes to whatever backend can read it. A clip as the input is how
+    # you get a demo that renders the same frames twice, and how you test a
+    # change against footage instead of against whatever the room looks like.
+    if is_still(device):
+        cap = StillCapture(device)
+    elif is_device(device):
+        cap = cv2.VideoCapture(int(device[len("/dev/video"):]), cv2.CAP_V4L2)
+    else:
+        cap = cv2.VideoCapture(device, cv2.CAP_ANY)
     if not cap.isOpened():
         # Raised, not exited: muting closes the camera and unmuting reopens it,
         # and losing that race to another app must not take the pipeline down.
         raise RuntimeError(f"could not open {device}")
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    cap.set(cv2.CAP_PROP_FPS, fps)
+    if is_device(device):
+        # Meaningless for a file, and setting them logs warnings on some builds.
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        cap.set(cv2.CAP_PROP_FPS, fps)
     # Do NOT set CAP_PROP_BUFFERSIZE=1 here. It looks like a latency win, but a
     # one-frame queue makes the consumer miss every other frame and halves the
     # rate to exactly 15 fps. Measured: default and 4 give 29.9, 1 gives 15.0.
@@ -187,7 +243,8 @@ def open_panel(spec, panel, device, dtype, width, height, fps):
 
 def build_parser():
     p = argparse.ArgumentParser(description="GPU-accelerated virtual webcam")
-    p.add_argument("--input", default="/dev/video0")
+    p.add_argument("--input", default="/dev/video0",
+                   help="/dev/videoN, or a video file to run instead of a camera")
     p.add_argument("--output", default="/dev/video10")
     p.add_argument("--width", type=int, default=1920)
     p.add_argument("--height", type=int, default=1080)
@@ -427,6 +484,11 @@ def main():
             while not stop:
                 if cap is not None:
                     ok, frame = cap.read()
+                    if not ok and not is_device(args.input):
+                        # A clip that ran out. Rewind rather than stop: an input
+                        # file is there to be watched for as long as you like.
+                        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                        ok, frame = cap.read()
                     if not ok:
                         print("aicam: lost the camera feed", file=sys.stderr)
                         break

@@ -118,6 +118,19 @@ Then pick **AI Cam** as your camera. The real camera must be free when aicam
 starts; Chrome does not release `/dev/video0` until every tab that used it is
 closed.
 
+`--input` does not have to be a camera:
+
+```sh
+./aicam --input clip.mp4                  # a clip, looped
+./aicam --input person.png                # a still, held
+```
+
+A file is how you get a demo that renders the same frames twice, and how you
+test a change against footage rather than against whatever the room looks like
+today. Clips loop at the end; a still is served frame after frame, because
+OpenCV hands an image over exactly once and cannot seek back to it. The output
+takes the file's own size, so a square picture gives you a square camera.
+
 The panel opens as tall as it needs, or as tall as the monitor it lands on,
 whichever is less - and scrolls when it is the latter. On a multi-head X11
 session that means the monitor it is actually on, not the two of them added

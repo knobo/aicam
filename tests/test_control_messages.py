@@ -3,6 +3,7 @@
 These are the paths the GUI and aicamctl drive, so they run without CUDA.
 """
 
+import cv2
 import os
 
 import pytest
@@ -228,3 +229,50 @@ def test_close_pipe_lets_a_well_behaved_process_exit_on_eof():
                     stdin=sp.PIPE)
     aicam.close_pipe(proc, timeout=5)
     assert proc.returncode == 0
+
+
+# ---------------------------------------------------------------- input
+
+def test_a_file_can_stand_in_for_the_camera(luma_clip):
+    """Pinning the V4L2 backend made OpenCV refuse anything that is not a
+    camera, which ruled out running the pipeline against footage."""
+    cap, width, height = aicam.open_camera(luma_clip, 1920, 1080, 30)
+    try:
+        assert cap.isOpened()
+        ok, frame = cap.read()
+        assert ok and frame is not None
+        # The clip's own size, not the one that was asked for: a file decides.
+        assert (width, height) == (frame.shape[1], frame.shape[0])
+    finally:
+        cap.release()
+
+
+def test_a_device_path_is_told_from_a_file():
+    assert aicam.is_device("/dev/video0")
+    assert aicam.is_device("/dev/video10")
+    assert not aicam.is_device("clip.mp4")
+    assert not aicam.is_device("/home/me/videos/dev/video0.mp4")
+
+
+def test_a_still_image_can_stand_in_for_the_camera(tmp_path):
+    """OpenCV gives a still exactly one frame and cannot seek back to it, so
+    without its own capture the pipeline reports the camera lost on frame two."""
+    import numpy as np
+    path = str(tmp_path / "person.png")
+    cv2.imwrite(path, np.full((480, 640, 3), 128, np.uint8))
+
+    cap, width, height = aicam.open_camera(path, 1920, 1080, 30)
+    assert (width, height) == (640, 480)
+    for _ in range(3):                      # it must keep giving frames
+        ok, frame = cap.read()
+        assert ok and frame.shape == (480, 640, 3)
+    cap.release()
+
+
+def test_a_still_is_told_from_a_clip(luma_clip, tmp_path):
+    import numpy as np
+    still = str(tmp_path / "a.png")
+    cv2.imwrite(still, np.zeros((8, 8, 3), np.uint8))
+    assert aicam.is_still(still)
+    assert not aicam.is_still(luma_clip)
+    assert not aicam.is_still("/dev/video0")
