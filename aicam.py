@@ -12,10 +12,12 @@ Licensed under the GNU General Public License v3.0 or later; see LICENSE.
 import argparse
 import math
 import os
+import queue
 import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 import cv2
@@ -154,6 +156,44 @@ def close_pipe(proc, timeout=5):
             proc.wait()
 
 
+class Preview:
+    """ffplay fed from its own thread, so a window nobody looks at can't slow the stream.
+
+    GNOME stops frame callbacks to a covered window, ffplay then stops reading,
+    and a blocking write in the main loop held the camera at ~4 fps. A frame
+    that arrives while the last one is still being written is dropped instead.
+    """
+
+    def __init__(self, proc):
+        self.proc = proc
+        self._frames = queue.Queue(maxsize=1)
+        threading.Thread(target=self._pump, daemon=True).start()
+
+    def _pump(self):
+        while True:
+            frame = self._frames.get()
+            try:
+                self.proc.stdin.write(frame)
+            except (OSError, ValueError):
+                return      # window closed; the stream carries on
+
+    def poll(self):
+        return self.proc.poll()
+
+    def show(self, frame):
+        try:
+            self._frames.put_nowait(frame)
+        except queue.Full:
+            pass
+
+    def close(self):
+        # Not close_pipe: closing stdin waits on a write ffplay may never finish,
+        # and ffplay holds no loopback device that a hard stop could wedge.
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            self.proc.wait(timeout=5)
+
+
 def open_preview(width, height, fps):
     """Preview through ffplay.
 
@@ -168,7 +208,7 @@ def open_preview(width, height, fps):
         "-window_title", "aicam", "-i", "-",
     ]
     try:
-        return subprocess.Popen(cmd, stdin=subprocess.PIPE)
+        return Preview(subprocess.Popen(cmd, stdin=subprocess.PIPE))
     except FileNotFoundError:
         # Toggled live as well as at startup, so a missing ffplay must not be fatal.
         print("aicam: preview needs ffplay (apt install ffmpeg)", file=sys.stderr)
@@ -538,7 +578,7 @@ def main():
                             if msg["preview"] and (preview is None or preview.poll() is not None):
                                 preview = open_preview(width, height, args.fps)
                             elif not msg["preview"] and preview is not None:
-                                close_pipe(preview)
+                                preview.close()
                                 preview = None
                         if "trigger" in msg:
                             start(msg["trigger"])
@@ -751,10 +791,7 @@ def main():
                     break
 
                 if preview is not None and preview.poll() is None:
-                    try:
-                        preview.stdin.write(out.tobytes())
-                    except BrokenPipeError:
-                        preview = None      # window closed; the stream carries on
+                    preview.show(out)
 
                 frames += 1
                 if frames % 15 == 0:
@@ -803,7 +840,8 @@ def main():
         if server is not None:
             server.close()
         close_pipe(sink)
-        close_pipe(preview)
+        if preview is not None:
+            preview.close()
     print("\naicam: stopped", file=sys.stderr)
 
 
