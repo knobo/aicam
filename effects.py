@@ -305,25 +305,28 @@ class AutoFramer:
         """Forget the crop, so switching back on reframes from what is there now."""
         self.box = None
 
-    def target(self, subject, aspect, zoom):
-        """Where the crop wants to be for this subject box."""
+    def target(self, subject, zoom):
+        """Where the crop wants to be for this subject box.
+
+        Sizes are fractions of the frame, one per axis, so the crop keeps the
+        frame's own shape exactly when the two fractions are equal - not when
+        their ratio is the aspect. Getting that backwards squeezes the picture
+        by the aspect twice over, and a face comes out narrow.
+        """
         x0, y0, x1, y1 = subject
-        w = (x1 - x0) * (1 + self.MARGIN)
-        h = (y1 - y0) * (1 + self.MARGIN)
-        # Widen to the output aspect rather than squeezing the picture into it.
-        w = min(max(w, h * aspect, 1.0 / max(zoom, 1.0)), 1.0)
-        h = min(w / aspect, 1.0)
-        w = h * aspect
+        w = h = min(max((x1 - x0) * (1 + self.MARGIN),
+                        (y1 - y0) * (1 + self.MARGIN),
+                        1.0 / max(zoom, 1.0)), 1.0)
         cx = min(max((x0 + x1) / 2, w / 2), 1 - w / 2)
         cy = min((y0 + y1) / 2, y0 + h / 2 - self.HEADROOM * h)
         cy = min(max(cy, h / 2), 1 - h / 2)
         return (cx, cy, w, h)
 
-    def advance(self, subject, aspect, zoom):
+    def advance(self, subject, zoom):
         """Step the crop one frame towards the subject. Returns the crop to use."""
         if subject is None:
             return self.box     # nobody in shot: hold the last framing
-        want = self.target(subject, aspect, zoom)
+        want = self.target(subject, zoom)
         if self.box is None:
             self.box = want
         elif max(abs(a - b) for a, b in zip(want, self.box)) > self.DEADZONE:
@@ -333,7 +336,7 @@ class AutoFramer:
     def apply(self, img, alpha, zoom):
         """Reframe `img` on the subject in `alpha`. Both are [1,3|1,H,W]."""
         h, w = img.shape[-2:]
-        box = self.advance(subject_box(alpha), w / h, zoom)
+        box = self.advance(subject_box(alpha), zoom)
         if box is None:
             return img
         cx, cy, bw, bh = box
