@@ -52,7 +52,8 @@ What it does, in one list:
 
 ## Requirements
 
-- Linux with `v4l2loopback` (ships with `linux-modules-$(uname -r)` on Ubuntu 24.04)
+- Linux with `v4l2loopback`, 0.15.4 or newer. Ubuntu 24.04 ships 0.12.7 in
+  `linux-modules-$(uname -r)`, which wedges; see Troubleshooting.
 - An NVIDIA GPU with CUDA. Measured on an RTX 4070 SUPER; anything from a 2060 up
   should hold 30 fps.
 - `ffmpeg` (also provides `ffplay`, used for the preview)
@@ -535,6 +536,18 @@ weights are redistributed here; they are downloaded on first run.
 
 ## Troubleshooting
 
+**`RuntimeError: CUDA error: out of memory` right after "loading"** — something
+else holds the GPU. aicam needs a few GB of VRAM, and a local LLM (ollama,
+llama.cpp) keeps its model loaded on the card until it times out:
+
+```sh
+nvidia-smi --query-compute-apps=pid,used_memory,process_name --format=csv
+ollama ps                  # then: ollama stop <model>
+```
+
+Started from the panel, this shows only as "no aicam running"; the traceback
+goes to the terminal the panel was started from.
+
 **"Device or resource busy"** — something else is streaming from the camera.
 Chrome holds it until every tab that used it is closed:
 
@@ -556,14 +569,36 @@ ffmpeg -f v4l2 -input_format mjpeg -video_size 1920x1080 -framerate 30 \
 ```
 
 **`ioctl(VIDIOC_G_FMT): Invalid argument` when aicam starts** — the loopback
-device is wedged. Reload the module:
+device is wedged. Reload the module to get going again:
 
 ```sh
 sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback
 ```
 
-It seems to happen when a consumer is still attached as the producer stops, so
-close the Teams tab and the preview *before* stopping aicam.
+The cause is v4l2loopback 0.12.7, the version Ubuntu 24.04 ships. When aicam
+dies without closing its ffmpeg (a crash, `kill -9`, a hung session), the device
+is left advertising neither output nor capture, and every later producer fails
+until the module is reloaded. 0.15.4 does not do this: the same kill-and-restart
+sequence that wedged 0.12.7 here runs clean on it. Check what you have:
+
+```sh
+cat /sys/module/v4l2loopback/version
+```
+
+No such file means 0.12.7, which does not export its version.
+
+To replace it, install upstream through DKMS, which rebuilds it for every new
+kernel and takes precedence over the one in `linux-modules`:
+
+```sh
+git clone https://github.com/umlaeute/v4l2loopback && cd v4l2loopback
+sudo mkdir /usr/src/v4l2loopback-0.15.4
+git archive v0.15.4 | sudo tar -x -C /usr/src/v4l2loopback-0.15.4
+sudo dkms install v4l2loopback/0.15.4
+sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback
+```
+
+`sudo dkms remove v4l2loopback/0.15.4 --all` goes back to Ubuntu's.
 
 Note that `v4l2-ctl -d /dev/video10 --get-fmt-video` prints **the same error when
 everything is fine**, as long as no producer is attached: with `exclusive_caps=1`
