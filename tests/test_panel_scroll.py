@@ -17,6 +17,11 @@ import gui  # noqa: E402
 pytestmark = pytest.mark.skipif(not os.environ.get("DISPLAY"),
                                 reason="no X display")
 
+# Under GNOME Wayland the window does not get the tall geometry it asks for,
+# so the panel still scrolls where these tests expect it to fit.
+needs_x11 = pytest.mark.skipif(os.environ.get("XDG_SESSION_TYPE") == "wayland",
+                               reason="Wayland ignores the tall geometry")
+
 TALL, SHORT = "420x1200", "420x480"
 
 
@@ -45,6 +50,7 @@ def test_a_short_window_gets_a_scrollbar(panel):
     assert panel._bar.winfo_ismapped()
 
 
+@needs_x11
 def test_a_tall_enough_window_does_not(panel):
     resize(panel, TALL)
     assert not panel._bar.winfo_ismapped()
@@ -64,6 +70,7 @@ def test_the_wheel_scrolls_the_panel_rather_than_the_control_under_it(panel):
     assert panel.tool.get() == before
 
 
+@needs_x11
 def test_the_wheel_does_nothing_when_it_all_fits(panel):
     resize(panel, TALL)
     panel.run_button.event_generate("<Button-5>", x=5, y=5)
@@ -71,6 +78,7 @@ def test_the_wheel_does_nothing_when_it_all_fits(panel):
     assert panel._view.yview()[0] == 0.0
 
 
+@needs_x11
 def test_growing_the_window_brings_the_top_back(panel):
     """Scrolled to the bottom, then made tall: the controls must not stay parked
     above the top of the window with no way to reach them."""

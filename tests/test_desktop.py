@@ -127,6 +127,8 @@ def test_a_window_grab_asks_x11grab_for_that_window():
 # ---------------------------------------------------------------- live capture
 
 @pytest.mark.skipif(not os.environ.get("DISPLAY"), reason="needs an X display")
+@pytest.mark.skipif(os.environ.get("XDG_SESSION_TYPE") == "wayland",
+                    reason="x11grab sees only XWayland windows, not the desktop")
 def test_capturing_the_real_desktop_yields_a_frame():
     import torch
     source = desktop.DesktopBackground("desktop", torch.device("cpu"), torch.float32,
