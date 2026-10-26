@@ -68,4 +68,4 @@ def test_a_failed_launch_says_why(panel):
     assert panel.stage["text"] == ("failed: the loopback device is\n"
                                    "wedged. Reload the module:\nsudo modprobe")
     assert panel.stage.winfo_manager() == "grid"
-    assert panel.run_button["text"] == "Start"
+    assert panel.run_button["text"] == "▶ ENGAGE"     # i.e. Start

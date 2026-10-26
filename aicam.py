@@ -34,6 +34,7 @@ import effects  # noqa: E402
 import history  # noqa: E402
 import overlays  # noqa: E402
 import particles  # noqa: E402
+import telemetry  # noqa: E402
 from control import ControlServer  # noqa: E402
 from depth import DepthEstimator  # noqa: E402
 from scenes import SCENES  # noqa: E402
@@ -205,14 +206,70 @@ def open_preview(width, height, fps):
         "-fflags", "nobuffer", "-flags", "low_delay",
         "-f", "rawvideo", "-pixel_format", "rgb24",
         "-video_size", f"{width}x{height}", "-framerate", str(fps),
-        "-window_title", "aicam", "-i", "-",
+        "-window_title", "aicam preview", "-i", "-",
     ]
+    # SDL names the window's class after the binary, so GNOME shows "ffplay"
+    # with no icon. As "aicam" it matches the desktop entry, like the panel.
+    env = dict(os.environ, SDL_VIDEO_X11_WMCLASS="aicam", SDL_VIDEO_WAYLAND_WMCLASS="aicam")
     try:
-        return Preview(subprocess.Popen(cmd, stdin=subprocess.PIPE))
+        return Preview(subprocess.Popen(cmd, stdin=subprocess.PIPE, env=env))
     except FileNotFoundError:
         # Toggled live as well as at startup, so a missing ffplay must not be fatal.
         print("aicam: preview needs ffplay (apt install ffmpeg)", file=sys.stderr)
         return None
+
+
+# ---------------------------------------------------------------- snapshots
+
+def _xdg_pictures():
+    return subprocess.run(["xdg-user-dir", "PICTURES"], capture_output=True,
+                          text=True, check=True, timeout=2).stdout
+
+
+def pictures_dir(run=_xdg_pictures):
+    """Where a snapshot goes when no path was given: where the desktop keeps pictures."""
+    try:
+        found = run().strip()
+    except (OSError, subprocess.SubprocessError):
+        found = ""
+    directory = found or os.path.expanduser("~/Pictures")
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError:
+        return os.path.expanduser("~")
+    return directory
+
+
+def open_new_snapshot(directory, now=None):
+    """aicam-<time>.png in `directory`, opened for writing, never one that exists.
+
+    Exclusive create rather than an exists() check: two snapshots in the same
+    second are encoded on two threads, and both would see the name as free.
+    """
+    stem = os.path.join(directory, time.strftime("aicam-%Y%m%d-%H%M%S", time.localtime(now)))
+    n = 1
+    while True:
+        try:
+            return open(stem + (f"-{n}" if n > 1 else "") + ".png", "xb")
+        except FileExistsError:
+            n += 1
+
+
+def save_snapshot(rgb, target, done, warn, run=_xdg_pictures):
+    """Write one output frame as a PNG. Runs on a thread of its own: encoding
+    1080p takes tens of milliseconds, a whole frame. A disk that is full or a
+    path that is wrong is said, never raised - it would take the camera down."""
+    try:
+        ok, png = cv2.imencode(".png", rgb[:, :, ::-1])     # cv2 wants BGR
+        if not ok:
+            raise ValueError("could not encode the frame")
+        f = open(target, "wb") if isinstance(target, str) else \
+            open_new_snapshot(pictures_dir(run))
+        with f:
+            f.write(png.tobytes())
+        done(f.name)
+    except (OSError, ValueError, cv2.error) as exc:
+        warn(f"snapshot failed: {exc}")
 
 
 # ------------------------------------------------------- live control messages
@@ -373,6 +430,7 @@ def build_parser():
 
 def main():
     args = build_parser().parse_args()
+    started = time.monotonic()
 
     if not args.no_control:
         try:
@@ -447,6 +505,22 @@ def main():
     server = None if args.no_control else ControlServer(args.socket)
     if server:
         print(f"aicam: control socket at {server.path}", file=sys.stderr)
+    gpu = telemetry.GpuPoller() if server else None
+    budget = telemetry.Budget()
+    events = telemetry.EventLog()
+
+    def warn(text):
+        """Said on stderr for the terminal, and in the event log for the panel."""
+        print(f"aicam: {text}", file=sys.stderr)
+        events.add(f"error: {text}")
+
+    snapshot = None         # a snapshot asked for: True, or the path to write it to
+    last_snapshot = None
+
+    def snapped(path):
+        nonlocal last_snapshot
+        last_snapshot = path
+        events.add(f"snapshot: {os.path.basename(path)}")
 
     pool = particles.ParticleSystem(device, capacity=args.particles)
     canvas = drawing.Canvas(device)
@@ -496,9 +570,10 @@ def main():
             try:
                 cap = open_camera(args.input, args.width, args.height, args.fps)[0]
             except RuntimeError as exc:
-                print(f"aicam: {exc}, staying muted", file=sys.stderr)
+                warn(f"{exc}, staying muted")
                 return
         muted = on
+        events.add("mute: on" if on else "mute: off")
 
     def handle_signal(*_):
         nonlocal stop
@@ -522,6 +597,8 @@ def main():
     try:
         with torch.no_grad():
             while not stop:
+                # Only the frames that feed a state update, every 15th.
+                budget.start(server is not None and frames % 15 == 14)
                 if cap is not None:
                     ok, frame = cap.read()
                     if not ok and not is_device(args.input):
@@ -531,6 +608,7 @@ def main():
                         ok, frame = cap.read()
                     if not ok:
                         print("aicam: lost the camera feed", file=sys.stderr)
+                        events.add("camera feed lost")
                         break
                 else:
                     # The camera used to do the pacing. Sleep out whatever is
@@ -540,6 +618,9 @@ def main():
                     idle = 1.0 / args.fps - (time.monotonic() - last)
                     if idle > 0:
                         time.sleep(idle)
+                # Includes waiting for the camera, so a fast pipeline shows a long
+                # capture: the frame rate is the camera's, not ours.
+                budget.lap("capture", "cpu")
 
                 now = time.monotonic()
                 dt = min(now - last, 0.1)      # clamp so a hiccup cannot teleport particles
@@ -559,7 +640,8 @@ def main():
                         if not gestures_on:
                             continue    # drained anyway, so nothing fires late
                         from gestures import GESTURE_SCENES
-                        start(GESTURE_SCENES.get(gesture, ""))
+                        if start(GESTURE_SCENES.get(gesture, "")):
+                            events.add(f"gesture: {GESTURE_SCENES[gesture]}")
 
                 if server is not None:
                     for msg in server.drain():
@@ -577,20 +659,25 @@ def main():
                         if "preview" in msg:
                             if msg["preview"] and (preview is None or preview.poll() is not None):
                                 preview = open_preview(width, height, args.fps)
+                                events.add("preview: on")
                             elif not msg["preview"] and preview is not None:
                                 preview.close()
                                 preview = None
-                        if "trigger" in msg:
-                            start(msg["trigger"])
+                                events.add("preview: off")
+                        if "trigger" in msg and start(msg["trigger"]):
+                            events.add(f"trigger: {msg['trigger']}")
+                        if msg.get("snapshot"):
+                            snapshot = msg["snapshot"]
                         if msg.get("clear"):
                             active.clear()
                             pool.alive[:] = False
+                            events.add("clear")
                         if "draw" in msg:
                             draw_mode = bool(msg["draw"]) and detector is not None
+                            events.add("draw: on" if draw_mode else "draw: off")
                             if msg["draw"] and detector is None:
-                                print("aicam: nothing to draw with - hand tracking "
-                                      "is off (needs mediapipe and --gestures)",
-                                      file=sys.stderr)
+                                warn("nothing to draw with - hand tracking "
+                                     "is off (needs mediapipe and --gestures)")
                             if not draw_mode:
                                 canvas.end()
                         if "ink" in msg and msg["ink"] in drawing.PALETTE:
@@ -610,23 +697,28 @@ def main():
                         if "overlay" in msg or "overlay_layer" in msg:
                             try:
                                 overlay = apply_overlay_message(msg, overlay, device)
+                                events.add(f"overlay: {history.label(overlay.path)}, "
+                                           f"{overlay.layer}" if overlay else "overlay: off")
                             except (FileNotFoundError, ValueError) as exc:
-                                print(f"aicam: {exc}", file=sys.stderr)
+                                warn(exc)
                         if "window" in msg:
                             try:
                                 panel = open_panel(msg["window"], panel, device, dtype,
                                                    width, height, args.fps)
+                                events.add(f"window: {panel.label}" if panel else "window: off")
                             except (ValueError, RuntimeError) as exc:
-                                print(f"aicam: {exc}", file=sys.stderr)
+                                warn(exc)
                         if "background" in msg:
                             try:
                                 background_source = apply_background_message(
                                     msg, background_source, device, dtype,
                                     width=width, height=height, fps=args.fps)
+                                events.add(f"background: {history.label(background_source.path)}"
+                                           if background_source else "background: off")
                             # A bad path, an unknown monitor, a Wayland session: say so
                             # and keep running on the background that already works.
                             except (FileNotFoundError, ValueError, RuntimeError) as exc:
-                                print(f"aicam: {exc}", file=sys.stderr)
+                                warn(exc)
 
                 # Pinch to hold. Grabbing an empty hand pulls out whatever screen
                 # is already the background, so the trick needs no setup at all.
@@ -654,11 +746,16 @@ def main():
                 if panel is not None and panel.held and pointer is not None:
                     panel.move_to(pointer[0], pointer[1])
 
+                # Gestures, the socket and the pinch, all on the host. The GPU is idle
+                # since the last frame's download, so its clock is the host's here.
+                budget.lap("control")
                 src = torch.from_numpy(frame).to(device, non_blocking=True)
                 src = src.permute(2, 0, 1)[None].flip(1).to(dtype) / 255.0     # BGR -> RGB
 
                 fgr, pha, *rec = matting(src, *rec, downsample_ratio=settings["downsample"])
+                budget.lap("matting")      # includes the upload
                 d = depth_model(src)
+                budget.lap("depth")
 
                 # Ink goes down here and nowhere else: this is the one point in
                 # the frame where the depth map exists, and every point of a
@@ -751,6 +848,7 @@ def main():
                     # and particles behind you still pass in front of it.
                     base = overlays.composite_over(base, clip)
 
+                budget.lap("look")         # background, bokeh, parallax, panel
                 for scene in list(active):
                     scene.spawn(pool, dt, width, height, focus)
                     if not scene.advance(dt):
@@ -765,6 +863,7 @@ def main():
                     front = drawing.over(ink_front, front)
                     behind = drawing.over(ink_behind, behind)
                 out = particles.composite(base, subject, subject_alpha, front, behind)
+                budget.lap("particles")    # and the ink, which shares their layers
 
                 if clip_layer == "front":
                     out = overlays.composite_over(out, clip)
@@ -778,9 +877,18 @@ def main():
                 # are all carried by the same camera move.
                 if auto_frame:
                     out = framer.apply(out, pha, settings["frame_zoom"])
+                budget.lap("light")        # front overlay, studio light, auto-frame
 
                 out = (out.clamp(0, 1) * 255).round().to(torch.uint8)
                 out = out[0].permute(1, 2, 0).contiguous().cpu().numpy()
+                budget.lap("transfer")
+
+                # Exactly what the loopback gets. `out` is a fresh array every
+                # frame and nothing writes to it, so the thread needs no copy.
+                if snapshot:
+                    threading.Thread(target=save_snapshot, daemon=True,
+                                     args=(out, snapshot, snapped, warn)).start()
+                    snapshot = None
 
                 try:
                     sink.stdin.write(out.tobytes())
@@ -789,6 +897,8 @@ def main():
                           "  sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback",
                           file=sys.stderr)
                     break
+                budget.lap("write", "cpu")
+                budget.finish()
 
                 if preview is not None and preview.poll() is None:
                     preview.show(out)
@@ -823,6 +933,15 @@ def main():
                             "overlay": overlay.path if overlay else None,
                             "overlay_layer": overlay.layer if overlay else args.overlay_layer,
                             "background": background_source.path if background_source else None,
+                            "gpu": gpu.latest,
+                            "vram": torch.cuda.memory_reserved() // 2**20,
+                            "budget": budget.ms,
+                            "uptime": round(time.monotonic() - started, 1),
+                            "camera": f"{width}x{height}",
+                            "output": args.output,
+                            "variant": args.variant,
+                            "events": events.recent(),
+                            "last_snapshot": last_snapshot,
                             **settings,
                         }
 
