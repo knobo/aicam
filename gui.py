@@ -596,10 +596,12 @@ class Panel:
             alive = self.proc is not None and self.proc.poll() is None
             if alive and self.launching:
                 # Still "Starting…" while a launch we made is loading its model.
-                lines = self._log_lines()
+                # torch.hub and timm chatter on stderr too; only aicam's own
+                # lines say where it is.
+                lines = [line for line in self._log_lines() if line.startswith("aicam:")]
                 self.progress.configure(value=max(
                     (i + 1 for i, stage in enumerate(STAGES)
-                     if any(line.startswith("aicam:") and stage in line for line in lines)),
+                     if any(stage in line for line in lines)),
                     default=0))
                 if lines:
                     self.stage.configure(text=lines[-1].removeprefix("aicam: "))

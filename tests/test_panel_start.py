@@ -47,13 +47,14 @@ def test_every_stage_is_something_aicam_prints():
 def test_progress_keeps_the_furthest_stage(panel):
     launch(panel, "import sys, time\n"
                   "sys.stderr.write('aicam: loading rvm\\naicam: loaded MiDaS_small\\n"
-                  "Downloading control socket\\naicam: camera gave 640x480\\n')\n"
+                  "Downloading control socket\\naicam: camera gave 640x480\\n"
+                  "Using cache found in hub\\n')\n"
                   "sys.stderr.flush(); time.sleep(5)")
     deadline = time.monotonic() + 5
     while "camera gave" not in open(gui.LOG).read() and time.monotonic() < deadline:
         time.sleep(0.02)
     panel.refresh()
-    # A line aicam did not write as aicam: does not count as a stage.
+    # Lines aicam did not write as aicam: neither count as a stage nor show.
     assert panel.progress["value"] == 2
     assert panel.stage["text"] == "camera gave 640x480"
 
