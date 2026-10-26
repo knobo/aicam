@@ -11,6 +11,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import tkinter as tk
 from tkinter import filedialog, ttk
 
@@ -37,6 +38,12 @@ SLIDERS = [
     ("frame_zoom", 1, 2.5, "Auto-frame zoom"),
     ("ink_width", 1, 20, "Ink width"),
 ]
+# What aicam prints on stderr as it starts, in order, so the panel can tell how
+# far a launch has come. Lines missing (no gestures) just skip a step.
+STAGES = ["loading", "loaded MiDaS", "gestures", "control socket", "Ctrl-C to stop"]
+# aicam's stderr when the panel starts it. A file, not a pipe: aicam outlives
+# the panel, and a pipe nobody reads any more kills it on its next print.
+LOG = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "aicam.log")
 
 
 class Panel:
@@ -79,6 +86,17 @@ class Panel:
                         command=lambda: self.send({"mirror": self.mirror.get()})).grid(
             row=row, column=1, sticky="w", padx=2, pady=(0, 8))
         row += 1
+        # Shown only while a launch we made is loading; aicam takes a while
+        # before the socket answers, and a disabled button alone says nothing.
+        self.progress = ttk.Progressbar(frame, maximum=len(STAGES), mode="determinate")
+        self.progress.grid(row=row, column=0, columnspan=3, sticky="ew", padx=2)
+        self.stage = ttk.Label(frame, foreground="#888", wraplength=360)
+        self.stage.grid(row=row + 1, column=0, columnspan=3, sticky="w",
+                        padx=2, pady=(2, 8))
+        self.progress.grid_remove()
+        self.stage.grid_remove()
+        self.launching = False
+        row += 2
 
         ttk.Label(frame, text="Reactions", font=("", 11, "bold")).grid(
             row=row, column=0, columnspan=3, sticky="w", pady=(0, 6))
@@ -354,8 +372,22 @@ class Panel:
                os.path.join(here, "aicam.py")]
         if self.socket_path:
             cmd += ["--socket", self.socket_path]
-        self.proc = subprocess.Popen(cmd)
+        with open(LOG, "w") as log:
+            self.proc = subprocess.Popen(cmd, stderr=log)
+        self.launching = True
+        self.progress.configure(value=0)
+        self.progress.grid()
+        self.stage.configure(text="starting Python and CUDA…", foreground="#888")
+        self.stage.grid()
         self.run_button.configure(text="Starting…", state="disabled")
+
+    def _log_lines(self):
+        # Text mode reads the fps counter's \r as a line end too.
+        try:
+            with open(LOG, errors="replace") as f:
+                return [line.strip() for line in f if line.strip()]
+        except OSError:
+            return []
 
     def trigger(self, name):
         self.send({"trigger": name})
@@ -534,6 +566,10 @@ class Panel:
 
             # Same rule as the sliders: do not overwrite a box the user is in.
             self.run_button.configure(text="Stop", state="normal")
+            if self.launching:
+                self.launching = False
+                self.progress.grid_remove()
+                self.stage.grid_remove()
             self.preview.set(bool(state.get("preview")))
             self.muted.set(bool(state.get("muted")))
             self.mirror.set(bool(state.get("mirror")))
@@ -557,11 +593,33 @@ class Panel:
                      f"   ·   {hands} hand{'' if hands == 1 else 's'}   ·   {state.get('mode', '?')}",
                 foreground="#2a7")
         else:
-            # Still "Starting…" while a launch we made is loading its model.
-            if self.proc is None or self.proc.poll() is not None:
-                self.proc = None
+            alive = self.proc is not None and self.proc.poll() is None
+            if alive and self.launching:
+                # Still "Starting…" while a launch we made is loading its model.
+                lines = self._log_lines()
+                self.progress.configure(value=max(
+                    (i + 1 for i, stage in enumerate(STAGES)
+                     if any(line.startswith("aicam:") and stage in line for line in lines)),
+                    default=0))
+                if lines:
+                    self.stage.configure(text=lines[-1].removeprefix("aicam: "))
+                self.status.configure(text="starting aicam…", foreground="#888")
+            elif not alive:
+                if self.proc is not None:
+                    self.launching = False
+                    self.progress.grid_remove()
+                    if self.proc.returncode == 0:
+                        self.stage.grid_remove()
+                    else:
+                        # Its last words say why: no CUDA, wedged loopback, out of
+                        # memory. Some reasons take more than one line.
+                        self.stage.configure(
+                            text="failed: " + "\n".join(self._log_lines()[-3:]),
+                            foreground="#c33")
+                        self.stage.grid()
+                    self.proc = None
                 self.run_button.configure(text="Start", state="normal")
-            self.status.configure(text="no aicam running", foreground="#c33")
+                self.status.configure(text="no aicam running", foreground="#c33")
         self.root.after(500, self.refresh)
 
 
