@@ -104,7 +104,9 @@ their own path with `readlink` before looking for their siblings.
 
 The panel sets its Tk `className`, so the window reports `WM_CLASS = "aicam"`
 and the shell can pair it with the desktop entry; without that Tk calls itself
-`Tk` and the window gets a generic icon.
+`Tk` and the window gets a generic icon. The ffplay preview is started with
+`SDL_VIDEO_X11_WMCLASS=aicam` for the same reason; otherwise the window switcher
+calls it "ffplay".
 
 ## Use
 
@@ -131,6 +133,39 @@ test a change against footage rather than against whatever the room looks like
 today. Clips loop at the end; a still is served frame after frame, because
 OpenCV hands an image over exactly once and cannot seek back to it. The output
 takes the file's own size, so a square picture gives you a square camera.
+
+### The panel
+
+<img src="docs/panel.png" alt="The aicam panel: a dark HUD with a live indicator, an fps gauge, GPU and frame-budget telemetry, reaction tiles and segmented sliders" width="438" align="right">
+
+`./aicam-gui`, or **aicam** from the application menu, opens a HUD that says at
+a glance whether the camera is live, and how the pipeline is doing:
+
+- **CAM LIVE / CAM MUTED / BOOTING / OFFLINE / FAULT** in the header, with the
+  model, the camera size, the loopback device and the uptime under it
+- fps against 30, and its last 25 seconds
+- the GPU's load, temperature and VRAM, with aicam's own share marked
+- the **frame budget**: one bar of where each frame's milliseconds go, matting,
+  depth, look and so on, against the 33 ms a frame has. Waiting for the camera
+  is hatched, because that is the camera's time, not ours
+- a boot sequence while aicam loads, and the reason in red when it does not start
+- the last few things that happened: gestures, reactions, background changes
+- **CAPTURE**, which saves the frame the meeting sees to `~/Pictures`
+
+Every control is a Tab away and works with Space, Return and the arrow keys. The
+animation costs about 1.5% of one core.
+
+The ☀/☾ at the right of the header switches between the dark HUD and a light
+one; hold it, right-click it or press Shift+Return on it for the colour themes:
+ice, phosphor, nostromo, synthwave and arctic. It starts as GNOME's colour
+scheme says and remembers your pick in `~/.config/aicam/panel.json`.
+
+The screenshot is the panel against a stand-in for aicam, so the numbers are
+made up.
+
+<br clear="right">
+
+![The panel in each colour theme, dark above and light below](docs/themes.png)
 
 The panel opens as tall as it needs, or as tall as the monitor it lands on,
 whichever is less - and scrolls when it is the latter. On a multi-head X11
@@ -487,6 +522,7 @@ Everything is reachable at runtime over that socket:
 ./aicamctl mirror / mute / preview    # each takes a trailing 'off'
 ./aicamctl gestures off               # stop reactions, keep hand tracking
 ./aicamctl auto_frame
+./aicamctl snapshot                   # the output frame, as a PNG in ~/Pictures
 ./aicamctl stop                       # shut the pipeline down cleanly
 ```
 
@@ -496,7 +532,7 @@ playing where it was rather than restarting it.
 
 `stop` is the right way to end a run. aicam closes its ffmpeg by letting it see
 EOF, then SIGTERM, and only then gives up — a killed ffmpeg is what leaves
-v4l2loopback wedged for the next run. The panel's **Start/Stop** button goes
+v4l2loopback wedged for the next run. The panel's **ENGAGE/DISENGAGE** button goes
 through the same socket, and aicam refuses to start beside a running instance,
 because two writers on one loopback device is exactly what wedges it.
 

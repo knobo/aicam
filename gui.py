@@ -7,11 +7,13 @@ which means the panel can be opened, closed and reopened without disturbing the
 pipeline.
 """
 
+import collections
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import tkinter as tk
 from tkinter import filedialog, ttk
 
@@ -19,6 +21,7 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
 
 import control  # noqa: E402
+import hud  # noqa: E402
 
 BACKGROUNDS = os.path.join(HERE, "backgrounds")
 IMAGE_OR_VIDEO = ("*.jpg", "*.jpeg", "*.png", "*.webp",
@@ -26,6 +29,8 @@ IMAGE_OR_VIDEO = ("*.jpg", "*.jpeg", "*.png", "*.webp",
 VIDEO = ("*.mp4", "*.mov", "*.mkv", "*.webm", "*.gif", "*.avi")
 
 SCENES = ["confetti", "hearts", "fireworks", "balloons", "rain"]
+SCENE_GLYPHS = {"confetti": "✦", "hearts": "♥", "fireworks": "✺",
+                "balloons": "◍", "rain": "⁞"}
 INKS = ["white", "yellow", "pink", "cyan", "green", "orange"]
 TOOLS = ["pen", "laser", "line", "rect", "eraser"]
 SLIDERS = [
@@ -41,6 +46,9 @@ SLIDERS = [
 # What aicam prints on stderr as it starts, in order, so the panel can tell how
 # far a launch has come. Lines missing (no gestures) just skip a step.
 STAGES = ["loading", "loaded MiDaS", "gestures", "control socket", "Ctrl-C to stop"]
+# What the boot log calls each of them.
+BOOT_LABELS = ["matting model", "MiDaS depth", "hand tracking", "control socket",
+               "camera → loopback"]
 # aicam's stderr when the panel starts it. A file, not a pipe: aicam outlives
 # the panel, and a pipe nobody reads any more kills it on its next print.
 LOG = os.path.join(os.environ.get("XDG_RUNTIME_DIR") or tempfile.gettempdir(), "aicam.log")
@@ -52,193 +60,192 @@ class Panel:
         self.socket_path = socket_path
         self.connected = False
         self._suppress = False
-
-        root.title("aicam")
-        root.minsize(380, 220)
-
-        frame = self._scrolling_body(root)
-        frame.columnconfigure((0, 1, 2), weight=1)
-
-        row = 0
         self.proc = None
-        self.run_button = ttk.Button(frame, text="Start", command=self.toggle_run)
-        self.run_button.grid(row=row, column=0, sticky="ew", padx=2, pady=(0, 8))
-        self.preview = tk.BooleanVar()
-        ttk.Checkbutton(frame, text="Preview window", variable=self.preview,
-                        command=lambda: self.send({"preview": self.preview.get()})).grid(
-            row=row, column=1, sticky="w", padx=2, pady=(0, 8))
-        self.mirror = tk.BooleanVar()
-        self.muted = tk.BooleanVar()
-        ttk.Checkbutton(frame, text="Mute camera", variable=self.muted,
-                        command=lambda: self.send({"mute": self.muted.get()})).grid(
-            row=row, column=2, sticky="w", padx=2, pady=(0, 8))
-        row += 1
-        self.auto_frame = tk.BooleanVar()
-        ttk.Checkbutton(frame, text="Auto-frame", variable=self.auto_frame,
-                        command=lambda: self.send(
-                            {"auto_frame": self.auto_frame.get()})).grid(
-            row=row, column=2, sticky="w", padx=2, pady=(0, 8))
-        self.gestures = tk.BooleanVar()
-        ttk.Checkbutton(frame, text="Gestures", variable=self.gestures,
-                        command=lambda: self.send({"gestures": self.gestures.get()})).grid(
-            row=row, column=0, sticky="w", padx=2, pady=(0, 8))
-        ttk.Checkbutton(frame, text="Mirror me", variable=self.mirror,
-                        command=lambda: self.send({"mirror": self.mirror.get()})).grid(
-            row=row, column=1, sticky="w", padx=2, pady=(0, 8))
-        row += 1
-        # Shown only while a launch we made is loading; aicam takes a while
-        # before the socket answers, and a disabled button alone says nothing.
-        self.progress = ttk.Progressbar(frame, maximum=len(STAGES), mode="determinate")
-        self.progress.grid(row=row, column=0, columnspan=3, sticky="ew", padx=2)
-        self.stage = ttk.Label(frame, foreground="#888", wraplength=360)
-        self.stage.grid(row=row + 1, column=0, columnspan=3, sticky="w",
-                        padx=2, pady=(2, 8))
-        self.progress.grid_remove()
-        self.stage.grid_remove()
         self.launching = False
-        row += 2
+        self.failed = False
+        self.snapshot = None
+        self.fps_history = collections.deque(maxlen=50)
 
-        ttk.Label(frame, text="Reactions", font=("", 11, "bold")).grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=(0, 6))
-        row += 1
+        hud.setup(root)
+        root.title("aicam")
+        root.minsize(hud.px(380), hud.px(300))
+
+        # The header and the buttons below stay put; only the middle scrolls.
+        # Whether the camera is live, and the button that changes it, must
+        # never be a scroll away. ENGAGE is made first so it is first on Tab.
+        foot = tk.Frame(root, bg=hud.BG)
+        foot.grid(row=2, column=0, columnspan=2, sticky="ew", padx=hud.px(12),
+                  pady=(hud.px(4), hud.px(8)))
+        foot.columnconfigure(1, weight=1)
+        self.run_button = hud.Button(foot, "▶ ENGAGE", self.toggle_run,
+                                     height=36, size=15)
+        self.run_button.grid(row=1, column=1, sticky="ew")
+        self.capture_button = hud.Button(foot, "◉ CAPTURE", self.capture,
+                                         color=hud.BRIGHT, height=36, size=13)
+        self.capture_button.configure(width=hud.px(130), state="disabled")
+        self.capture_button.grid(row=1, column=0, sticky="ew", padx=(0, hud.px(6)))
+        self.snapshot_link = hud.Button(foot, "", self.open_snapshot, color=hud.SOFT,
+                                        height=20, size=10)
+        self.snapshot_link.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 5))
+        self.snapshot_link.grid_remove()
+
+        self.header = hud.Header(root)
+        self.header.grid(row=0, column=0, columnspan=2, sticky="ew", padx=hud.px(8),
+                         pady=(hud.px(8), 0))
+
+        body = self._scrolling_body(root)
+        body.columnconfigure(0, weight=1)
+        self._row = 0
+
+        # Telemetry and the boot sequence share a row: one or the other.
+        self.telemetry = hud.Telemetry(body)
+        self.telemetry.grid(row=0, column=0, sticky="ew", pady=(4, 0))
+        self.boot = tk.Frame(body, bg=hud.BG)
+        self.boot.grid(row=0, column=0, sticky="ew", pady=(4, 0))
+        self.boot.columnconfigure(0, weight=1)
+        self.progress = hud.BootLog(self.boot, BOOT_LABELS)
+        self.progress.grid(row=0, column=0, sticky="ew")
+        # aicam's own last line under the log, and on failure its last words.
+        self.stage = tk.Label(self.boot, bg=hud.BG, fg=hud.MUTED, font=hud.font(11),
+                              justify="left", anchor="w", wraplength=340)
+        self.stage.grid(row=1, column=0, sticky="ew", pady=(2, 0))
+        self.boot.bind("<Configure>",
+                       lambda e: self.stage.configure(wraplength=max(e.width - 8, 100)))
+        self.boot.grid_remove()
+        self._row = 1
+
+        box = self._section(body, "REACTIONS")
+        self.tiles = {}
         for i, name in enumerate(SCENES):
-            ttk.Button(frame, text=name.capitalize(),
-                       command=lambda n=name: self.trigger(n)).grid(
-                row=row + i // 3, column=i % 3, sticky="ew", padx=2, pady=2)
-        row += (len(SCENES) + 2) // 3
+            tile = hud.Button(box, name.upper(), lambda n=name: self.trigger(n),
+                              glyph=SCENE_GLYPHS[name], height=46)
+            tile.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 4, 0))
+            box.columnconfigure(i, weight=1, uniform="tile")
+            self.tiles[name] = tile
+        hud.Button(box, "✕ CLEAR ALL", self.clear, color=hud.AMBER).grid(
+            row=1, column=0, columnspan=len(SCENES), sticky="ew", pady=(4, 0))
 
-        ttk.Button(frame, text="Clear all", command=self.clear).grid(
-            row=row, column=0, columnspan=3, sticky="ew", padx=2, pady=(6, 10))
-        row += 1
-
-        ttk.Separator(frame).grid(row=row, column=0, columnspan=3, sticky="ew", pady=6)
-        row += 1
-        ttk.Label(frame, text="Draw in the air", font=("", 11, "bold")).grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=(0, 6))
-        row += 1
-
+        box = self._section(body, "SYSTEMS")
+        self.preview = tk.BooleanVar()
+        self.muted = tk.BooleanVar()
+        self.mirror = tk.BooleanVar()
+        self.gestures = tk.BooleanVar()
+        self.auto_frame = tk.BooleanVar()
         self.draw = tk.BooleanVar()
-        ttk.Checkbutton(frame, text="Pinch to draw", variable=self.draw,
-                        command=lambda: self.send({"draw": self.draw.get()})).grid(
-            row=row, column=0, sticky="w", padx=2)
-        ttk.Button(frame, text="Undo", command=lambda: self.send({"undo": True})).grid(
-            row=row, column=1, sticky="ew", padx=2)
-        ttk.Button(frame, text="Erase all",
-                   command=lambda: self.send({"erase": True})).grid(
-            row=row, column=2, sticky="ew", padx=2)
-        row += 1
+        for i, (text, key, var) in enumerate([
+                ("PREVIEW", "preview", self.preview), ("MUTE", "mute", self.muted),
+                ("MIRROR", "mirror", self.mirror), ("GESTURES", "gestures", self.gestures),
+                ("AUTO-FRAME", "auto_frame", self.auto_frame),
+                ("PINCH DRAW", "draw", self.draw)]):
+            hud.Toggle(box, text, var, lambda k=key, v=var: self.send({k: v.get()})).grid(
+                row=i // 3, column=i % 3, sticky="ew",
+                padx=(0 if i % 3 == 0 else 4, 0), pady=(0, 3))
+            box.columnconfigure(i % 3, weight=1, uniform="toggle")
 
+        box = self._section(body, "DRAW IN THE AIR")
+        box.columnconfigure((1, 3), weight=1)
+        hud.Button(box, "UNDO", lambda: self.send({"undo": True})).grid(
+            row=0, column=0, columnspan=2, sticky="ew", padx=(0, 2), pady=(0, 4))
+        hud.Button(box, "ERASE ALL", lambda: self.send({"erase": True})).grid(
+            row=0, column=2, columnspan=2, sticky="ew", padx=(2, 0), pady=(0, 4))
         self.tool = tk.StringVar(value="pen")
-        ttk.Label(frame, text="Tool").grid(row=row, column=0, sticky="w")
-        self.tool_box = tools = ttk.Combobox(frame, textvariable=self.tool, values=TOOLS,
-                                             state="readonly", width=8)
-        tools.grid(row=row, column=1, columnspan=2, sticky="ew", padx=2)
+        self.ink = tk.StringVar(value="yellow")
+        self._label(box, "TOOL").grid(row=1, column=0, sticky="w", padx=(0, 6))
+        self.tool_box = tools = self._combo(box, self.tool, TOOLS)
+        tools.grid(row=1, column=1, sticky="ew", padx=(0, 8))
         tools.bind("<<ComboboxSelected>>",
                    lambda _e: self.send({"tool": self.tool.get()}))
-        row += 1
-
-        self.ink = tk.StringVar(value="yellow")
-        ttk.Label(frame, text="Ink").grid(row=row, column=0, sticky="w")
-        self.ink_box = inks = ttk.Combobox(frame, textvariable=self.ink, values=INKS,
-                                           state="readonly", width=8)
-        inks.grid(row=row, column=1, columnspan=2, sticky="ew", padx=2)
+        self._label(box, "INK").grid(row=1, column=2, sticky="w", padx=(0, 6))
+        self.ink_box = inks = self._combo(box, self.ink, INKS)
+        inks.grid(row=1, column=3, sticky="ew")
         inks.bind("<<ComboboxSelected>>",
                   lambda _e: self.send({"ink": self.ink.get()}))
-        row += 1
 
-        ttk.Separator(frame).grid(row=row, column=0, columnspan=3, sticky="ew", pady=6)
-        row += 1
-        ttk.Label(frame, text="Look", font=("", 11, "bold")).grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=(0, 6))
-        row += 1
-
+        box = self._section(body, "OPTICS")
+        box.columnconfigure(0, weight=1)
         self.vars = {}
-        for key, lo, hi, label in SLIDERS:
-            ttk.Label(frame, text=label).grid(row=row, column=0, sticky="w")
+        self.sliders = {}
+        for i, (key, lo, hi, label) in enumerate(SLIDERS):
             var = tk.DoubleVar()
             self.vars[key] = var
-            scale = ttk.Scale(frame, from_=lo, to=hi, variable=var,
-                              command=lambda _v, k=key: self.on_slide(k))
-            scale.grid(row=row, column=1, columnspan=2, sticky="ew", padx=(6, 0))
-            row += 1
+            self.sliders[key] = hud.Slider(box, label.upper(), lo, hi, var,
+                                           lambda k=key: self.on_slide(k))
+            self.sliders[key].grid(row=i, column=0, sticky="ew")
 
-        ttk.Separator(frame).grid(row=row, column=0, columnspan=3, sticky="ew", pady=6)
-        row += 1
-        ttk.Label(frame, text="Overlay", font=("", 11, "bold")).grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=(0, 6))
-        row += 1
-
+        box = self._section(body, "OVERLAY")
+        box.columnconfigure((1, 3), weight=1)
         self.overlay_mode = tk.StringVar(value="luma")
-        ttk.Combobox(frame, textvariable=self.overlay_mode, values=["luma", "chroma"],
-                     state="readonly", width=8).grid(row=row, column=0, sticky="ew", padx=2)
-        ttk.Button(frame, text="Choose video…", command=self.pick_overlay).grid(
-            row=row, column=1, sticky="ew", padx=2)
-        ttk.Button(frame, text="Remove", command=lambda: self.send({"overlay": None})).grid(
-            row=row, column=2, sticky="ew", padx=2)
-        row += 1
-
+        self._label(box, "MODE").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self._combo(box, self.overlay_mode, ["luma", "chroma"]).grid(
+            row=0, column=1, sticky="ew", padx=(0, 8))
         # Sent on its own, so moving a clip between layers does not restart it.
         self.overlay_layer = tk.StringVar(value="front")
-        ttk.Label(frame, text="Layer").grid(row=row, column=0, sticky="w")
-        self.layer_box = layers = ttk.Combobox(frame, textvariable=self.overlay_layer,
-                              values=["front", "back"], state="readonly", width=8)
-        layers.grid(row=row, column=1, columnspan=2, sticky="ew", padx=2)
+        self._label(box, "LAYER").grid(row=0, column=2, sticky="w", padx=(0, 6))
+        self.layer_box = layers = self._combo(box, self.overlay_layer, ["front", "back"])
+        layers.grid(row=0, column=3, sticky="ew")
         layers.bind("<<ComboboxSelected>>", lambda _e: self.send(
             {"overlay_layer": self.overlay_layer.get()}))
-        row += 1
+        hud.Button(box, "CHOOSE VIDEO…", self.pick_overlay).grid(
+            row=1, column=0, columnspan=3, sticky="ew", padx=(0, 4), pady=(4, 0))
+        hud.Button(box, "REMOVE", lambda: self.send({"overlay": None})).grid(
+            row=1, column=3, sticky="ew", pady=(4, 0))
 
-        ttk.Separator(frame).grid(row=row, column=0, columnspan=3, sticky="ew", pady=6)
-        row += 1
-        ttk.Label(frame, text="Background", font=("", 11, "bold")).grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=(0, 6))
-        row += 1
-
-        self.background_label = ttk.Label(frame, text="none", foreground="#888")
-        self.background_label.grid(row=row, column=0, columnspan=3, sticky="w",
+        box = self._section(body, "BACKGROUND")
+        box.columnconfigure((0, 1, 2), weight=1, uniform="bg")
+        self.background_label = tk.Label(box, text="none", bg=hud.BG, fg=hud.TEXT,
+                                         font=hud.font(11), anchor="w")
+        self.background_label.grid(row=0, column=0, columnspan=3, sticky="ew",
                                    pady=(0, 4))
-        row += 1
-        ttk.Button(frame, text="Bundled…", command=self.pick_bundled).grid(
-            row=row, column=0, sticky="ew", padx=2)
-        ttk.Button(frame, text="Image/video…", command=self.pick_background).grid(
-            row=row, column=1, sticky="ew", padx=2)
-        ttk.Button(frame, text="Remove",
-                   command=lambda: self.send({"background": None})).grid(
-            row=row, column=2, sticky="ew", padx=2)
-        row += 1
-
-        ttk.Button(frame, text="Hold a window…",
-                   command=lambda: self.pick_desktop(hold=True)).grid(
-            row=row, column=0, columnspan=2, sticky="ew", padx=2)
-        ttk.Button(frame, text="Drop", command=lambda: self.send({"window": None})).grid(
-            row=row, column=2, sticky="ew", padx=2)
-        row += 1
-
-        ttk.Button(frame, text="Screen or window…", command=self.pick_desktop).grid(
-            row=row, column=0, columnspan=2, sticky="ew", padx=2)
-        ttk.Button(frame, text="Recent…", command=self.pick_recent).grid(
-            row=row, column=2, sticky="ew", padx=2)
-        row += 1
-
-        ttk.Label(frame, text="Stream a URL as the background").grid(
-            row=row, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        row += 1
-        ttk.Label(frame, text="a YouTube link, or a direct link to a video file",
-                  foreground="#888").grid(row=row, column=0, columnspan=3, sticky="w")
-        row += 1
-
+        for row, buttons in enumerate([
+                [("BUNDLED…", self.pick_bundled, 1),
+                 ("IMAGE/VIDEO…", self.pick_background, 1),
+                 ("REMOVE", lambda: self.send({"background": None}), 1)],
+                [("HOLD A WINDOW…", lambda: self.pick_desktop(hold=True), 2),
+                 ("DROP", lambda: self.send({"window": None}), 1)],
+                [("SCREEN OR WINDOW…", self.pick_desktop, 2),
+                 ("RECENT…", self.pick_recent, 1)]], start=1):
+            column = 0
+            for text, command, span in buttons:
+                hud.Button(box, text, command).grid(
+                    row=row, column=column, columnspan=span, sticky="ew",
+                    padx=(0 if column == 0 else 4, 0), pady=(0, 4))
+                column += span
+        self._label(box, "STREAM A URL · YouTube or a direct video link").grid(
+            row=4, column=0, columnspan=3, sticky="w", pady=(1, 1))
         self.url = tk.StringVar()
-        entry = ttk.Entry(frame, textvariable=self.url)
-        entry.grid(row=row, column=0, columnspan=2, sticky="ew", padx=2, pady=(4, 0))
+        entry = ttk.Entry(box, textvariable=self.url, font=hud.font(12))
+        entry.grid(row=5, column=0, columnspan=2, sticky="ew", padx=(0, 4))
         entry.bind("<Return>", lambda _e: self.use_url())
-        ttk.Button(frame, text="Paste URL", command=self.use_url).grid(
-            row=row, column=2, sticky="ew", padx=2, pady=(4, 0))
-        row += 1
+        hud.Button(box, "PASTE URL", self.use_url).grid(row=5, column=2, sticky="ew")
 
-        self.status = ttk.Label(frame, text="connecting…", foreground="#888")
-        self.status.grid(row=row, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        box = self._section(body, "EVENT LOG")
+        box.columnconfigure(0, weight=1)
+        self.events = hud.EventLog(box)
+        self.events.grid(row=0, column=0, sticky="ew")
 
-        self.wheel_scrolling(self._view)      # everything exists by now
+        # Everything exists by now. From the root down, so the header and the
+        # buttons under the scrolling part scroll it too.
+        self.wheel_scrolling(root)
         self.refresh()
+        self.animate()
+
+    def _section(self, body, title):
+        """A titled block in the scrolling body; returns the frame to fill."""
+        hud.Section(body, title).grid(row=self._row, column=0, sticky="ew",
+                                      pady=(hud.px(7), hud.px(3)))
+        box = tk.Frame(body, bg=hud.BG)
+        box.grid(row=self._row + 1, column=0, sticky="ew")
+        self._row += 2
+        return box
+
+    @staticmethod
+    def _label(parent, text):
+        return tk.Label(parent, text=text, bg=hud.BG, fg=hud.SOFT, font=hud.font(10))
+
+    @staticmethod
+    def _combo(parent, variable, values):
+        return ttk.Combobox(parent, textvariable=variable, values=values,
+                            state="readonly", width=8, font=hud.font(12))
 
     # ---------------------------------------------------------------- layout
 
@@ -246,19 +253,19 @@ class Panel:
         """Put the controls in a canvas that scrolls when the window is short.
 
         The panel has grown past the height of a laptop screen, and a control
-        you cannot reach is worse than one that is a scroll away - particularly
-        Start/Stop, which is at the top, and the background buttons, which are
-        at the bottom. The scrollbar only appears when there is something to
+        you cannot reach is worse than one that is a scroll away. ENGAGE and
+        the header sit outside it and never scroll away; the background
+        buttons, at the bottom, are what this is for. The scrollbar only appears when there is something to
         scroll to; at full height it would just be a stripe of nothing.
         """
-        view = tk.Canvas(root, highlightthickness=0, takefocus=0)
+        view = tk.Canvas(root, highlightthickness=0, takefocus=0, bg=hud.BG, height=1)
         bar = ttk.Scrollbar(root, orient="vertical", command=view.yview)
         view.configure(yscrollcommand=bar.set)
-        view.grid(row=0, column=0, sticky="nsew")
-        root.rowconfigure(0, weight=1)
+        view.grid(row=1, column=0, sticky="nsew", padx=(hud.px(12), 0))
+        root.rowconfigure(1, weight=1)
         root.columnconfigure(0, weight=1)
 
-        body = ttk.Frame(view, padding=12)
+        body = tk.Frame(view, bg=hud.BG, padx=0, pady=0)
         window = view.create_window((0, 0), window=body, anchor="nw")
         self._view, self._bar, self._body = view, bar, body
 
@@ -266,7 +273,7 @@ class Panel:
             view.configure(scrollregion=view.bbox("all"))
             needed = body.winfo_reqheight() > view.winfo_height()
             if needed and not bar.winfo_ismapped():
-                bar.grid(row=0, column=1, sticky="ns")
+                bar.grid(row=1, column=1, sticky="ns")
             elif not needed and bar.winfo_ismapped():
                 bar.grid_remove()
                 view.yview_moveto(0)        # or the top stays scrolled away
@@ -275,7 +282,8 @@ class Panel:
         # requested width: a canvas window does not stretch on its own, and a
         # panel whose buttons stop short of the edge looks broken.
         body.bind("<Configure>", fit)
-        view.bind("<Configure>", lambda e: (view.itemconfigure(window, width=e.width),
+        # 12 px short of the edge, so the panel keeps its right margin.
+        view.bind("<Configure>", lambda e: (view.itemconfigure(window, width=e.width - hud.px(12)),
                                             fit()))
 
         # Sized once the window manager has placed it: until then there is no
@@ -316,12 +324,14 @@ class Panel:
         Asked of the controls, not of the window: a canvas reports its own
         default size rather than the size of what is inside it, so the window
         would open 264 px tall and immediately need scrolling it did not need.
+        The fixed header and footer come on top of the scrolling part.
         """
         self.root.update_idletasks()
-        wanted = self._body.winfo_reqheight()
+        wanted = (self.root.winfo_reqheight() - self._view.winfo_reqheight()
+                  + self._body.winfo_reqheight())
         room = self._monitor_height() - 120             # panels, title bar, margin
         height = min(wanted, room)
-        width = max(self._body.winfo_reqwidth(), 380)
+        width = max(self._body.winfo_reqwidth() + hud.px(24), hud.px(420))
         if height < wanted:
             width += self._bar.winfo_reqwidth()         # room for the scrollbar
         self.root.geometry(f"{width}x{height}")
@@ -352,7 +362,9 @@ class Panel:
             reply = control.send(message, self.socket_path)
             self.connected = True
             return reply
-        except ConnectionError:
+        # OSError, not only ConnectionError: a stalled aicam times out instead,
+        # and an exception here would end the refresh poll for good.
+        except OSError:
             self.connected = False
             return None
 
@@ -375,11 +387,26 @@ class Panel:
         with open(LOG, "w") as log:
             self.proc = subprocess.Popen(cmd, stderr=log)
         self.launching = True
+        self.failed = self.progress.fault = False
         self.progress.configure(value=0)
-        self.progress.grid()
-        self.stage.configure(text="starting Python and CUDA…", foreground="#888")
-        self.stage.grid()
-        self.run_button.configure(text="Starting…", state="disabled")
+        self.stage.configure(text="starting Python and CUDA…", foreground=hud.MUTED)
+        self._show_boot(True)
+        self.run_button.configure(text="◌ SPINNING UP", state="disabled", color=hud.AMBER)
+        self.header.show("BOOTING", "starting aicam…")
+
+    def _show_boot(self, on):
+        """The boot sequence takes the telemetry's place, and gives it back."""
+        (self.boot if on else self.telemetry).grid()
+        (self.telemetry if on else self.boot).grid_remove()
+
+    def capture(self):
+        """Save the frame the meeting sees; aicam writes it, the header flashes."""
+        if self.send({"snapshot": True}) is not None:
+            self.header.shutter()
+
+    def open_snapshot(self):
+        if self.snapshot and shutil.which("xdg-open"):
+            subprocess.Popen(["xdg-open", self.snapshot])
 
     def _log_lines(self):
         # Text mode reads the fps counter's \r as a line end too.
@@ -388,6 +415,30 @@ class Panel:
                 return [line.strip() for line in f if line.strip()]
         except OSError:
             return []
+
+    def animate(self):
+        """Move the header's band and pulse its dot, about 15 times a second.
+
+        Only the header and the boot log animate; everything else is redrawn
+        by refresh(). Nothing is drawn while the window is minimised, so the
+        panel costs nothing during a meeting it is not shown in.
+        """
+        if self.root.state() not in ("iconic", "withdrawn"):
+            t = time.monotonic()
+            self.header.tick(t)
+            if self.launching:
+                self.progress.tick(t)
+        self.root.after(66, self.animate)
+
+    def _aicam_lines(self):
+        # torch.hub and timm chatter on stderr too; only aicam's own lines
+        # say where it is.
+        return [line for line in self._log_lines() if line.startswith("aicam:")]
+
+    @staticmethod
+    def _stage_reached(lines):
+        return max((i + 1 for i, stage in enumerate(STAGES)
+                    if any(stage in line for line in lines)), default=0)
 
     def trigger(self, name):
         self.send({"trigger": name})
@@ -560,16 +611,18 @@ class Panel:
             # Do not fight the user: only adopt values while the slider is idle.
             self._suppress = True
             for key, var in self.vars.items():
-                if key in state and abs(var.get() - float(state[key])) > 1e-6:
-                    var.set(float(state[key]))
+                value = hud.num(state.get(key))
+                if value is not None and not self.sliders[key].dragging \
+                        and abs(var.get() - value) > 1e-6:
+                    var.set(value)
             self._suppress = False
 
             # Same rule as the sliders: do not overwrite a box the user is in.
-            self.run_button.configure(text="Stop", state="normal")
-            if self.launching:
-                self.launching = False
-                self.progress.grid_remove()
-                self.stage.grid_remove()
+            self.run_button.configure(text="■ DISENGAGE", state="normal", color=hud.RED)
+            self.capture_button.configure(state="normal")
+            if self.launching or self.failed:
+                self.launching = self.failed = False
+                self._show_boot(False)
             self.preview.set(bool(state.get("preview")))
             self.muted.set(bool(state.get("muted")))
             self.mirror.set(bool(state.get("mirror")))
@@ -587,42 +640,68 @@ class Panel:
                 text=background if background and background.startswith("desktop")
                 else os.path.basename(background) if background else "none")
 
-            hands = state.get("hands", 0)
-            self.status.configure(
-                text=f"{state.get('fps', 0):.1f} fps   ·   {state.get('particles', 0)} particles"
-                     f"   ·   {hands} hand{'' if hands == 1 else 's'}   ·   {state.get('mode', '?')}",
-                foreground="#2a7")
+            fps = hud.num(state.get("fps"))
+            if fps is not None:
+                self.fps_history.append(fps)
+            self.header.show("MUTED" if state.get("muted") else "LIVE", self._info(state))
+            self.telemetry.show(state, self.fps_history)
+            self.events.show(state.get("events"))
+            scenes = state.get("scenes")
+            for name in scenes if isinstance(scenes, list) else ():
+                if name in self.tiles:
+                    self.tiles[name].flash()
+            snapshot = state.get("last_snapshot")
+            if isinstance(snapshot, str) and snapshot != self.snapshot:
+                self.snapshot = snapshot
+                self.snapshot_link.configure(text=f"▣ {os.path.basename(snapshot)}  ↗")
+                self.snapshot_link.grid()
         else:
+            self.capture_button.configure(state="disabled")
             alive = self.proc is not None and self.proc.poll() is None
             if alive and self.launching:
-                # Still "Starting…" while a launch we made is loading its model.
-                # torch.hub and timm chatter on stderr too; only aicam's own
-                # lines say where it is.
-                lines = [line for line in self._log_lines() if line.startswith("aicam:")]
-                self.progress.configure(value=max(
-                    (i + 1 for i, stage in enumerate(STAGES)
-                     if any(stage in line for line in lines)),
-                    default=0))
+                # Still booting while a launch we made is loading its model.
+                lines = self._aicam_lines()
+                self.progress.configure(value=self._stage_reached(lines))
                 if lines:
                     self.stage.configure(text=lines[-1].removeprefix("aicam: "))
-                self.status.configure(text="starting aicam…", foreground="#888")
+                self.header.show("BOOTING", "starting aicam…")
             elif not alive:
                 if self.proc is not None:
                     self.launching = False
-                    self.progress.grid_remove()
                     if self.proc.returncode == 0:
-                        self.stage.grid_remove()
+                        self._show_boot(False)
                     else:
                         # Its last words say why: no CUDA, wedged loopback, out of
                         # memory. Some reasons take more than one line.
+                        # It may have died between two polls; the log still
+                        # says how far it got, and so which stage failed.
+                        self.failed = self.progress.fault = True
+                        self.progress.configure(
+                            value=self._stage_reached(self._aicam_lines()))
                         self.stage.configure(
                             text="failed: " + "\n".join(self._log_lines()[-3:]),
-                            foreground="#c33")
-                        self.stage.grid()
+                            foreground=hud.RED)
+                        self._show_boot(True)
                     self.proc = None
-                self.run_button.configure(text="Start", state="normal")
-                self.status.configure(text="no aicam running", foreground="#c33")
+                self.run_button.configure(text="▶ ENGAGE", state="normal", color=hud.CYAN)
+                if self.failed:
+                    self.header.show("FAILED", "aicam did not start - see below")
+                else:
+                    self.header.show("OFFLINE", "no aicam running")
+                self.telemetry.show(None, ())
         self.root.after(500, self.refresh)
+
+    @staticmethod
+    def _info(state):
+        """`resnet50 · 1920x1080 → /dev/video10 · up 00:12:31`, dashes for gaps."""
+        def text(key):
+            value = state.get(key)
+            return str(value) if value else "—"
+        uptime = hud.num(state.get("uptime"))
+        if uptime is None and not any(state.get(k) for k in ("variant", "camera", "output")):
+            return "—"           # an aicam from before these fields
+        up = hud.clock(uptime) if uptime is not None else "—"
+        return f"{text('variant')} · {text('camera')} → {text('output')} · up {up}"
 
 
 def main():
@@ -634,10 +713,6 @@ def main():
     # className sets WM_CLASS to ("aicam", "Aicam"); without it Tk says "Tk"
     # and the window matches no desktop entry, so it gets no icon in the dock.
     root = tk.Tk(className="aicam")
-    try:
-        ttk.Style().theme_use("clam")
-    except tk.TclError:
-        pass
     Panel(root, a.socket)
     root.mainloop()
 
