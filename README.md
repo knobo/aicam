@@ -154,6 +154,9 @@ a glance whether the camera is live, and how the pipeline is doing:
 
 Every control is a Tab away and works with Space, Return and the arrow keys. The
 animation costs about 1.5% of one core.
+The ☀/☾ at the right of the header switches between the dark HUD and a light
+one; it starts as GNOME's colour scheme says and remembers your pick in
+`~/.config/aicam/panel.json`.
 
 The screenshot is the panel against a stand-in for aicam, so the numbers are
 made up.

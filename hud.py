@@ -10,28 +10,66 @@ takes focus with Tab, and Space or Return does what a click does. A control
 that is pretty but cannot be reached from the keyboard is a regression.
 """
 
+import json
 import math
+import os
+import subprocess
 import time
 import tkinter as tk
 from tkinter import font as tkfont, ttk
 
-BG = "#05080c"
-FIELD = "#0a1419"
-CYAN = "#3ef0ff"
-DIM = "#0f4a52"
-TRACK = "#0d2a30"
-AMBER = "#ffb238"
-RED = "#ff3b4e"
-TEXT = "#bfefff"
-SOFT = "#7fb3bd"
-MUTED = "#5e8a93"
-BRIGHT = "#e6fbff"
-OK = "#6effa0"
-DEAD = "#333b40"
+import history
 
-# Stacked budget segments, in pipeline order. Neighbours differ in hue as well
-# as brightness, so two short stages next to each other still read as two.
-SEGMENT_COLOURS = [CYAN, OK, AMBER, "#c08bff", "#ff7ac8", "#7f9cff", "#2bb8c6", SOFT]
+# The palettes. Every colour a widget draws with is one of these, by name, so
+# switching theme is: rebind the module globals below, then redraw. The dark one
+# is the HUD as designed; the light one is the same instrument in daylight -
+# deep teal where the dark one glows cyan, status colours darkened until they
+# read as text on near-white (WCAG AA, 4.5:1 or better, against BG).
+#
+# Within a palette every value is distinct: `apply_theme` recolours the plain
+# Tk widgets by looking up which name their old colour had.
+PALETTES = {
+    "dark": {
+        "BG": "#05080c", "FIELD": "#0a1419", "CYAN": "#3ef0ff", "DIM": "#0f4a52",
+        "TRACK": "#0d2a30", "AMBER": "#ffb238", "RED": "#ff3b4e", "TEXT": "#bfefff",
+        "SOFT": "#7fb3bd", "MUTED": "#5e8a93", "BRIGHT": "#e6fbff", "OK": "#6effa0",
+        "DEAD": "#333b40",
+        "OFF": "#2f4a52",           # a toggle's empty box
+        "SCAN": "#07141a",          # the header's scanlines
+        "SHARE": "#1b6d77",         # all of VRAM in use, behind aicam's share
+        "HAND_OFF": "#12303a",      # an unlit hand
+        "PENDING": "#3a4a50",       # a boot stage not reached yet
+        "ACTIVE": "#1a6a75",        # the scrollbar under the pointer
+        "FLASH": "#ffffff",         # the shutter
+        "PURPLE": "#c08bff", "PINK": "#ff7ac8", "BLUE": "#7f9cff", "TEAL": "#2bb8c6",
+    },
+    "light": {
+        "BG": "#f2f6f8", "FIELD": "#fcfeff", "CYAN": "#006f7c", "DIM": "#9fc7cd",
+        "TRACK": "#d6e4e8", "AMBER": "#955300", "RED": "#c0122c", "TEXT": "#1b3a42",
+        "SOFT": "#3c626b", "MUTED": "#4f727a", "BRIGHT": "#06242c", "OK": "#0d7340",
+        "DEAD": "#b3bec2",
+        "OFF": "#93abb1",
+        "SCAN": "#e7eff2",
+        "SHARE": "#8fc4cc",
+        "HAND_OFF": "#c8d7db",
+        "PENDING": "#97a9ae",
+        "ACTIVE": "#6fa8b1",
+        # White would vanish on BG; a cyan flash still says "taken".
+        "FLASH": "#1fc3d4",
+        "PURPLE": "#7a43cc", "PINK": "#c2307f", "BLUE": "#3d5ccc", "TEAL": "#178a96",
+    },
+}
+THEME = "dark"
+globals().update(PALETTES[THEME])
+
+
+def _segments():
+    # Stacked budget segments, in pipeline order. Neighbours differ in hue as
+    # well as brightness, so two short stages next to each other still read as two.
+    return [CYAN, OK, AMBER, PURPLE, PINK, BLUE, TEAL, SOFT]
+
+
+SEGMENT_COLOURS = _segments()
 
 FAMILY = "DejaVu Sans Mono"
 # Design pixels to screen pixels. Xft renders fonts at its own DPI (192 on a
@@ -83,8 +121,53 @@ def num(value):
     return float(value) if math.isfinite(value) else None
 
 
-def setup(root):
-    """Pick the font and paint the stock widgets dark.
+def config_path():
+    """~/.config/aicam/panel.json, beside the background history."""
+    return os.path.join(os.path.dirname(history.default_path()), "panel.json")
+
+
+def saved_theme(path=None):
+    """The theme the user last picked, or None if they never did."""
+    try:
+        with open(path or config_path()) as f:
+            theme = json.load(f).get("theme")
+    except (OSError, ValueError, AttributeError):     # missing, corrupt, not a dict
+        return None
+    return theme if theme in PALETTES else None
+
+
+def desktop_theme():
+    """What GNOME is set to; dark when it cannot be asked.
+
+    Dark is the fallback because it is what the HUD was designed as. The
+    timeout is there because this runs before the window shows.
+    """
+    try:
+        out = subprocess.run(["gsettings", "get", "org.gnome.desktop.interface",
+                              "color-scheme"], capture_output=True, text=True,
+                             timeout=1).stdout
+    except (OSError, subprocess.SubprocessError):
+        return "dark"
+    return "light" if "prefer-light" in out or "default" in out else "dark"
+
+
+def initial_theme():
+    return saved_theme() or desktop_theme()
+
+
+def save_theme(name, path=None):
+    """Remember the user's pick. Never raises: this is a nicety."""
+    path = path or config_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"theme": name}, f)
+    except OSError:
+        pass
+
+
+def setup(root, theme=None):
+    """Pick the font and the theme, and paint the stock widgets to match.
 
     Done per root rather than in main(): the tests build their own Tk and
     would otherwise get white comboboxes, which is exactly what this avoids.
@@ -98,8 +181,52 @@ def setup(root):
     # A monospace digit is 0.6 em in all three fonts; how wide a 100 px one
     # actually comes out says how much Xft scales.
     S = max(1.0, probe.measure("0") / 60)
-    root.configure(bg=BG)
+    _use(theme or initial_theme())
+    _style(root)
 
+
+def _use(name):
+    global THEME, SEGMENT_COLOURS
+    THEME = name
+    globals().update(PALETTES[name])
+    SEGMENT_COLOURS = _segments()
+
+
+def apply_theme(root, name):
+    """Switch theme in a running panel, with no restart.
+
+    The canvases draw from the module globals, so they only need a redraw.
+    The plain Tk widgets (frames, labels, the combobox drop-down, which Tk
+    builds out of sight of Python) hold the colour they were made with; each
+    is moved to the same name's colour in the new palette.
+    """
+    new = dict(PALETTES[name])
+    back = {PALETTES[THEME][k]: v for k, v in new.items()}
+    _use(name)
+    _style(root)
+
+    def recolour(path):
+        for entry in root.tk.splitlist(root.tk.call(path, "configure")):
+            entry = root.tk.splitlist(entry)
+            if len(entry) == 5 and str(entry[4]) in back:     # 2 long: an alias
+                root.tk.call(path, "configure", entry[0], back[str(entry[4])])
+        for child in root.tk.splitlist(root.tk.call("winfo", "children", path)):
+            recolour(str(child))
+
+    def redraw(widget):
+        if isinstance(widget, Widget):
+            if widget._opts.get("color") in back:
+                widget._opts["color"] = back[widget._opts["color"]]
+            widget.draw()
+        for child in widget.winfo_children():
+            redraw(child)
+
+    recolour(str(root))
+    redraw(root)
+
+
+def _style(root):
+    root.configure(bg=BG)
     style = ttk.Style(root)
     try:
         style.theme_use("clam")        # the only stock theme that takes colours
@@ -117,7 +244,7 @@ def setup(root):
     style.map("TEntry", bordercolor=[("focus", CYAN), ("!focus", DIM)])
     style.configure("Vertical.TScrollbar", background=DIM, troughcolor=BG,
                     bordercolor=BG, arrowcolor=CYAN, gripcount=0)
-    style.map("Vertical.TScrollbar", background=[("active", "#1a6a75")])
+    style.map("Vertical.TScrollbar", background=[("active", ACTIVE)])
     # The combobox drop-down and the background menus are plain Tk widgets
     # built later; the option database is how they get the colours too.
     for pattern, value in (("*TCombobox*Listbox.background", FIELD),
@@ -207,8 +334,11 @@ class Button(Widget):
 
     OPTIONS = ("text", "state", "color")
 
-    def __init__(self, parent, text, command, glyph=None, color=CYAN, height=22, size=11):
-        super().__init__(parent, height, focus=True, text=text, state="normal", color=color)
+    def __init__(self, parent, text, command, glyph=None, color=None, height=22, size=11):
+        # None, not CYAN: a default is fixed when the class is defined, and
+        # would stay the dark theme's cyan.
+        super().__init__(parent, height, focus=True, text=text, state="normal",
+                         color=color or CYAN)
         self.command, self.glyph, self.text_size = command, glyph, size
         self._glow, self._hover = 0.0, False
         self.activate_on(self.invoke)
@@ -283,7 +413,7 @@ class Toggle(Widget):
         self.create_text(7, h / 2, anchor="w", text=self.text,
                          fill=CYAN if on else SOFT, font=font(10))
         self.create_text(w - 7, h / 2, anchor="e", text="■" if on else "□",
-                         fill=CYAN if on else "#2f4a52", font=font(12))
+                         fill=CYAN if on else OFF, font=font(12))
 
 
 class Slider(Widget):
@@ -380,12 +510,13 @@ class Header(Widget):
     """
 
     # colour, tag text, pulse period in seconds (None: steady), blink
+    # The colour by name, looked up when drawn: the theme can change under it.
     MODES = {
-        "LIVE": (RED, "● CAM LIVE", 1.2, False),
-        "MUTED": (AMBER, "CAM MUTED", 2.4, False),
-        "BOOTING": (AMBER, "BOOTING", 0.5, True),
-        "OFFLINE": (DEAD, "OFFLINE", None, False),
-        "FAILED": (RED, "FAULT", None, False),
+        "LIVE": ("RED", "● CAM LIVE", 1.2, False),
+        "MUTED": ("AMBER", "CAM MUTED", 2.4, False),
+        "BOOTING": ("AMBER", "BOOTING", 0.5, True),
+        "OFFLINE": ("DEAD", "OFFLINE", None, False),
+        "FAILED": ("RED", "FAULT", None, False),
     }
     BAND = 16           # strips in the sweeping band
 
@@ -393,6 +524,25 @@ class Header(Widget):
         super().__init__(parent, 64)
         self.mode, self.info = "OFFLINE", "connecting…"
         self._shutter = 0.0
+        # The theme switch is the glyph at the right of the title row. The
+        # header takes focus for it and draws its own focus ring round the
+        # glyph: a ring round the whole header would not say what Space does.
+        self.configure(takefocus=1)
+        self._focused = False
+        for sequence in ("<space>", "<Return>", "<KP_Enter>"):
+            self.bind(sequence, lambda _e: self.toggle_theme())
+        self.tag_bind("theme", "<Button-1>", lambda _e: self.toggle_theme())
+        self.bind("<FocusIn>", lambda _e: self._set_focus(True))
+        self.bind("<FocusOut>", lambda _e: self._set_focus(False))
+
+    def _set_focus(self, on):
+        self._focused = on
+        self.draw()
+
+    def toggle_theme(self):
+        name = "light" if THEME == "dark" else "dark"
+        apply_theme(self.winfo_toplevel(), name)
+        save_theme(name)
 
     def show(self, mode, info):
         if mode != self.mode:
@@ -406,12 +556,13 @@ class Header(Widget):
         w, h = self.size()
         if w < 60:
             return
-        colour, tag, _period, _blink = self.MODES[self.mode]
+        name, tag, _period, _blink = self.MODES[self.mode]
+        colour = globals()[name]
         top, bottom = 6, 42
         self.create_rectangle(8, top + 1, w - 8, bottom, width=0, tags=("shutter",),
                               fill=BG)
         for y in range(top + 1, bottom, 3):
-            self.create_line(8, y, w - 8, y, fill="#07141a")
+            self.create_line(8, y, w - 8, y, fill=SCAN)
         for i in range(self.BAND):
             bell = math.sin(math.pi * (i + 0.5) / self.BAND)
             self.create_rectangle(0, top + 1, 0, bottom - 1, width=0, tags=("band",),
@@ -426,10 +577,17 @@ class Header(Widget):
         self.create_oval(18, cy - 5, 28, cy + 5, width=0, tags=("dot",), fill=colour)
         self.create_text(40, cy, anchor="w", text="AICAM", fill=CYAN, font=font(20, "bold"))
         tag_colour = MUTED if self.mode == "OFFLINE" else colour
-        label = self.create_text(w - 20, cy, anchor="e", text=tag, fill=tag_colour,
+        label = self.create_text(w - 50, cy, anchor="e", text=tag, fill=tag_colour,
                                  font=font(12, "bold"))
-        x0 = w - 20 - self.text_width(label)
-        self.create_rectangle(x0 - 8, cy - 11, w - 14, cy + 11, outline=tag_colour)
+        x0 = w - 50 - self.text_width(label)
+        self.create_rectangle(x0 - 8, cy - 11, w - 44, cy + 11, outline=tag_colour)
+        # The theme switch shows where a press takes you: the sun in the dark.
+        gx = w - 26
+        self.create_rectangle(gx - 11, cy - 11, gx + 11, cy + 11, fill=BG, tags=("theme",),
+                              outline=CYAN if self._focused else DIM,
+                              width=2 * S if self._focused else 1)
+        self.create_text(gx, cy, text="☀" if THEME == "dark" else "☾", fill=CYAN,
+                         font=font(14), tags=("theme",))
         self.create_text(9, bottom + 12, anchor="w", text=self.info, fill=MUTED, tags=("info",),
                          font=font(10))
 
@@ -443,7 +601,7 @@ class Header(Widget):
             return
         if self._shutter > 0:
             self._shutter = max(0.0, self._shutter - 0.12)
-            self.itemconfigure("shutter", fill=mix(BG, "#ffffff", 0.85 * self._shutter))
+            self.itemconfigure("shutter", fill=mix(BG, FLASH, 0.85 * self._shutter))
         # The band crosses the box in three seconds, and is clipped by hand to
         # the box: a canvas cannot clip, and a band poking out looks broken.
         left, right = 8, w - 8
@@ -455,7 +613,8 @@ class Header(Widget):
             b = min(start + (i + 1) * strip, right)
             self.coords(item, a * S, 7 * S, max(a, b) * S, 41 * S)
 
-        colour, _tag, period, blink = self.MODES[self.mode]
+        name, _tag, period, blink = self.MODES[self.mode]
+        colour = globals()[name]
         if period is None:
             level = 1.0 if self.mode != "OFFLINE" else 0.0
         elif blink:
@@ -500,7 +659,7 @@ class Telemetry(Widget):
         x0, x1 = 50, w - 128
         self.create_text(3, y, anchor="w", text=label, fill=SOFT, font=font(10))
         self.create_rectangle(x0, y - 3, x1, y + 4, width=0, fill=TRACK)
-        for part, fill in ((under, "#1b6d77"), (frac, colour)):
+        for part, fill in ((under, SHARE), (frac, colour)):
             if part is not None:
                 part = min(max(part, 0.0), 1.0)
                 self.create_rectangle(x0, y - 3, x0 + (x1 - x0) * part, y + 4,
@@ -553,7 +712,7 @@ class Telemetry(Widget):
         for i in range(2):
             lit = hands is not None and hands > i
             self.create_text(x0 + 8 + i * 30, 72, anchor="w", text="✋",
-                             fill=CYAN if lit else "#12303a", font=font(22))
+                             fill=CYAN if lit else HAND_OFF, font=font(22))
         pcol = x0 + max(74, (w - x0) * 0.42)
         self._stat(pcol, 52, "PARTICLES · MODE")
         particles = num(s.get("particles"))
@@ -684,7 +843,7 @@ class BootLog(Widget):
             elif i == done:
                 mark, colour, label = "[ ▸▸ ]", AMBER, label + "…"
             else:
-                mark, colour = "[ -- ]", "#3a4a50"
+                mark, colour = "[ -- ]", PENDING
             self.create_text(3, y, anchor="w", text=f"{mark} {label}", fill=colour,
                              font=font(11))
 
