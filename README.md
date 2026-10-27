@@ -154,6 +154,7 @@ a glance whether the camera is live, and how the pipeline is doing:
 
 Every control is a Tab away and works with Space, Return and the arrow keys. The
 animation costs about 1.5% of one core.
+
 The ☀/☾ at the right of the header switches between the dark HUD and a light
 one; hold it, right-click it or press Shift+Return on it for the colour themes:
 ice, phosphor, nostromo, synthwave and arctic. It starts as GNOME's colour
@@ -163,6 +164,8 @@ The screenshot is the panel against a stand-in for aicam, so the numbers are
 made up.
 
 <br clear="right">
+
+![The panel in each colour theme, dark above and light below](docs/themes.png)
 
 The panel opens as tall as it needs, or as tall as the monitor it lands on,
 whichever is less - and scrolls when it is the latter. On a multi-head X11
