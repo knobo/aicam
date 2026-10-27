@@ -10,6 +10,7 @@ takes focus with Tab, and Space or Return does what a click does. A control
 that is pretty but cannot be reached from the keyboard is a regression.
 """
 
+import colorsys
 import json
 import math
 import os
@@ -21,14 +22,15 @@ from tkinter import font as tkfont, ttk
 import history
 
 # The palettes. Every colour a widget draws with is one of these, by name, so
-# switching theme is: rebind the module globals below, then redraw. The dark one
-# is the HUD as designed; the light one is the same instrument in daylight -
-# deep teal where the dark one glows cyan, status colours darkened until they
-# read as text on near-white (WCAG AA, 4.5:1 or better, against BG).
+# switching theme is: rebind the module globals below, then redraw. A theme is
+# a mode, dark or light, and an accent. Dark ice is the HUD as designed; light
+# ice is the same instrument in daylight - deep teal where the dark one glows
+# cyan, status colours darkened until they read as text on near-white (WCAG AA,
+# 4.5:1 or better, against BG).
 #
 # Within a palette every value is distinct: `apply_theme` recolours the plain
 # Tk widgets by looking up which name their old colour had.
-PALETTES = {
+ICE = {
     "dark": {
         "BG": "#05080c", "FIELD": "#0a1419", "CYAN": "#3ef0ff", "DIM": "#0f4a52",
         "TRACK": "#0d2a30", "AMBER": "#ffb238", "RED": "#ff3b4e", "TEXT": "#bfefff",
@@ -59,8 +61,77 @@ PALETTES = {
         "PURPLE": "#7a43cc", "PINK": "#c2307f", "BLUE": "#3d5ccc", "TEAL": "#178a96",
     },
 }
-THEME = "dark"
-globals().update(PALETTES[THEME])
+# The names that carry the accent; the status colours (RED, AMBER, OK) and the
+# budget segments keep their hue in every theme, so LIVE is red everywhere.
+TINTED = ("BG", "FIELD", "CYAN", "DIM", "TRACK", "TEXT", "SOFT", "MUTED", "BRIGHT",
+          "DEAD", "OFF", "SCAN", "SHARE", "HAND_OFF", "PENDING", "ACTIVE", "FLASH")
+# accent: (hue in degrees, saturation scale, status hues moved out of its way).
+# Where a status colour would be the accent's own colour it gets another hue:
+# phosphor's OK goes cyan, nostromo's MUTED amber goes yellow.
+ACCENTS = {
+    "ice": None,
+    "phosphor": (125, 1.0, {"OK": 185}),
+    "nostromo": (28, 1.0, {"AMBER": 62}),
+    "synthwave": (285, 1.0, {}),
+    "arctic": (214, 0.45, {}),
+}
+DEFAULT_ACCENT = "ice"
+
+
+def luminance(colour):
+    """WCAG relative luminance."""
+    c = [int(colour[i:i + 2], 16) / 255 for i in (1, 3, 5)]
+    c = [x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4 for x in c]
+    return 0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+
+
+def contrast(a, b):
+    la, lb = sorted((luminance(a), luminance(b)), reverse=True)
+    return (la + 0.05) / (lb + 0.05)
+
+
+# Read as text, so they are held to 4.5:1 against BG whatever their hue.
+TEXT_NAMES = ("CYAN", "TEXT", "SOFT", "MUTED", "BRIGHT", "AMBER", "RED", "OK")
+
+
+def _rehue(colour, hue, sat=1.0, bg=None, need=4.6):
+    """colour turned to another hue, keeping its lightness and saturation.
+
+    Hues differ in luminance at the same lightness - green is brighter than
+    cyan, violet darker - so with `bg` given the colour is then moved away from
+    the background, just far enough to keep `need` contrast with it.
+    """
+    _h, light, s = colorsys.rgb_to_hls(*(int(colour[i:i + 2], 16) / 255 for i in (1, 3, 5)))
+
+    def at(lightness):
+        return "#%02x%02x%02x" % tuple(round(x * 255) for x in
+                                       colorsys.hls_to_rgb(hue / 360, lightness, s * sat))
+    if bg is None or contrast(at(light), bg) >= need:
+        return at(light)
+    lo, hi = light, 1.0 if luminance(bg) < 0.5 else 0.0     # lo fails, hi passes
+    for _ in range(30):
+        mid = (lo + hi) / 2
+        lo, hi = (lo, mid) if contrast(at(mid), bg) >= need else (mid, hi)
+    return at(hi)
+
+
+def _palette(accent, mode):
+    base = ICE[mode]
+    if ACCENTS[accent] is None:
+        return dict(base)
+    hue, sat, status = ACCENTS[accent]
+    palette = dict(base)
+    palette["BG"] = bg = _rehue(base["BG"], hue, sat)
+    for k in TINTED[1:]:
+        palette[k] = _rehue(base[k], hue, sat, bg if k in TEXT_NAMES else None)
+    for k, h in status.items():
+        palette[k] = _rehue(base[k], h, 1.0, bg)
+    return palette
+
+
+PALETTES = {(accent, mode): _palette(accent, mode) for accent in ACCENTS for mode in ICE}
+MODE, ACCENT = "dark", DEFAULT_ACCENT
+globals().update(PALETTES[ACCENT, MODE])
 
 
 def _segments():
@@ -127,13 +198,18 @@ def config_path():
 
 
 def saved_theme(path=None):
-    """The theme the user last picked, or None if they never did."""
+    """(mode, accent) as last picked; None for a mode never picked.
+
+    {"theme": "light"} is what the first version of the switch wrote.
+    """
     try:
         with open(path or config_path()) as f:
-            theme = json.load(f).get("theme")
+            saved = json.load(f)
+        mode, accent = saved.get("mode", saved.get("theme")), saved.get("accent")
     except (OSError, ValueError, AttributeError):     # missing, corrupt, not a dict
-        return None
-    return theme if theme in PALETTES else None
+        mode = accent = None
+    return (mode if mode in ICE else None,
+            accent if accent in ACCENTS else DEFAULT_ACCENT)
 
 
 def desktop_theme():
@@ -152,21 +228,22 @@ def desktop_theme():
 
 
 def initial_theme():
-    return saved_theme() or desktop_theme()
+    mode, accent = saved_theme()
+    return mode or desktop_theme(), accent
 
 
-def save_theme(name, path=None):
+def save_theme(mode, accent, path=None):
     """Remember the user's pick. Never raises: this is a nicety."""
     path = path or config_path()
     try:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
-            json.dump({"theme": name}, f)
+            json.dump({"mode": mode, "accent": accent}, f)
     except OSError:
         pass
 
 
-def setup(root, theme=None):
+def setup(root):
     """Pick the font and the theme, and paint the stock widgets to match.
 
     Done per root rather than in main(): the tests build their own Tk and
@@ -181,18 +258,18 @@ def setup(root, theme=None):
     # A monospace digit is 0.6 em in all three fonts; how wide a 100 px one
     # actually comes out says how much Xft scales.
     S = max(1.0, probe.measure("0") / 60)
-    _use(theme or initial_theme())
+    _use(*initial_theme())
     _style(root)
 
 
-def _use(name):
-    global THEME, SEGMENT_COLOURS
-    THEME = name
-    globals().update(PALETTES[name])
+def _use(mode, accent):
+    global MODE, ACCENT, SEGMENT_COLOURS
+    MODE, ACCENT = mode, accent
+    globals().update(PALETTES[accent, mode])
     SEGMENT_COLOURS = _segments()
 
 
-def apply_theme(root, name):
+def apply_theme(root, mode, accent):
     """Switch theme in a running panel, with no restart.
 
     The canvases draw from the module globals, so they only need a redraw.
@@ -200,9 +277,8 @@ def apply_theme(root, name):
     builds out of sight of Python) hold the colour they were made with; each
     is moved to the same name's colour in the new palette.
     """
-    new = dict(PALETTES[name])
-    back = {PALETTES[THEME][k]: v for k, v in new.items()}
-    _use(name)
+    back = {PALETTES[ACCENT, MODE][k]: v for k, v in PALETTES[accent, mode].items()}
+    _use(mode, accent)
     _style(root)
 
     def recolour(path):
@@ -519,6 +595,7 @@ class Header(Widget):
         "FAILED": ("RED", "FAULT", None, False),
     }
     BAND = 16           # strips in the sweeping band
+    HOLD = 0.5          # seconds on the theme switch that open the picker
 
     def __init__(self, parent):
         super().__init__(parent, 64)
@@ -527,11 +604,24 @@ class Header(Widget):
         # The theme switch is the glyph at the right of the title row. The
         # header takes focus for it and draws its own focus ring round the
         # glyph: a ring round the whole header would not say what Space does.
+        #
+        # A click flips dark and light; holding it opens the accent picker,
+        # and a ring fills round the glyph meanwhile so the hold is found by
+        # accident rather than only by reading the README. Right-click,
+        # Shift+Return and the Menu key open the picker at once.
         self.configure(takefocus=1)
         self._focused = False
+        self._held = None           # when the switch was pressed, while it is
+        self._glyph = (0, 0)
         for sequence in ("<space>", "<Return>", "<KP_Enter>"):
             self.bind(sequence, lambda _e: self.toggle_theme())
-        self.tag_bind("theme", "<Button-1>", lambda _e: self.toggle_theme())
+        for sequence in ("<Shift-Return>", "<Shift-KP_Enter>", "<KeyPress-Menu>"):
+            self.bind(sequence, lambda _e: self.pick_theme())
+        self.tag_bind("theme", "<ButtonPress-1>", lambda _e: self.press())
+        self.tag_bind("theme", "<Button-3>", lambda _e: self.pick_theme())
+        # On the canvas, not the glyph: a release a few pixels off it still
+        # ends the press.
+        self.bind("<ButtonRelease-1>", lambda _e: self.release())
         self.bind("<FocusIn>", lambda _e: self._set_focus(True))
         self.bind("<FocusOut>", lambda _e: self._set_focus(False))
 
@@ -539,10 +629,38 @@ class Header(Widget):
         self._focused = on
         self.draw()
 
+    def press(self):
+        self._held = time.monotonic()
+
+    def release(self):
+        """A release before the hold ran out was a click."""
+        if self._held is not None:
+            self._held = None
+            self.toggle_theme()
+
     def toggle_theme(self):
-        name = "light" if THEME == "dark" else "dark"
-        apply_theme(self.winfo_toplevel(), name)
-        save_theme(name)
+        self.set_theme("light" if MODE == "dark" else "dark", ACCENT)
+
+    def set_theme(self, mode, accent):
+        apply_theme(self.winfo_toplevel(), mode, accent)
+        save_theme(mode, accent)
+
+    def pick_theme(self):
+        """The accents as a menu under the switch, the current one ticked."""
+        self._held = None
+        self.itemconfigure("hold", state="hidden")
+        # Made fresh each time, so it takes the theme's colours from the
+        # option database.
+        menu = tk.Menu(self, tearoff=0)
+        # ■ and □ as on the system switches; Tk's radio dot is a speck at this size.
+        for name in ACCENTS:
+            menu.add_command(label=("■ " if name == ACCENT else "□ ") + name,
+                             command=lambda n=name: self.set_theme(MODE, n))
+        menu.update_idletasks()         # or it has no width yet to align by
+        # Right-aligned under the switch, which sits at the window's edge.
+        gx, cy = self._glyph
+        menu.tk_popup(self.winfo_rootx() + round((gx + 11) * S) - menu.winfo_reqwidth(),
+                      self.winfo_rooty() + round((cy + 14) * S))
 
     def show(self, mode, info):
         if mode != self.mode:
@@ -586,8 +704,11 @@ class Header(Widget):
         self.create_rectangle(gx - 11, cy - 11, gx + 11, cy + 11, fill=BG, tags=("theme",),
                               outline=CYAN if self._focused else DIM,
                               width=2 * S if self._focused else 1)
-        self.create_text(gx, cy, text="☀" if THEME == "dark" else "☾", fill=CYAN,
+        self.create_text(gx, cy, text="☀" if MODE == "dark" else "☾", fill=CYAN,
                          font=font(14), tags=("theme",))
+        self.create_arc(gx - 15, cy - 15, gx + 15, cy + 15, style="arc", start=90, extent=0,
+                        outline=CYAN, width=2 * S, state="hidden", tags=("hold",))
+        self._glyph = (gx, cy)
         self.create_text(9, bottom + 12, anchor="w", text=self.info, fill=MUTED, tags=("info",),
                          font=font(10))
 
@@ -596,6 +717,12 @@ class Header(Widget):
         self._shutter = 1.0
 
     def tick(self, t):
+        if self._held is not None:
+            held = (t - self._held) / self.HOLD
+            if held >= 1:
+                self.pick_theme()
+            else:
+                self.itemconfigure("hold", state="normal", extent=-359.9 * max(held, 0.01))
         w, _h = self.size()
         if w < 60:
             return
