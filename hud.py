@@ -590,6 +590,7 @@ class Header(Widget):
     MODES = {
         "LIVE": ("RED", "● CAM LIVE", 1.2, False),
         "MUTED": ("AMBER", "CAM MUTED", 2.4, False),
+        "REC": ("RED", "● REC", 0.6, True),
         "BOOTING": ("AMBER", "BOOTING", 0.5, True),
         "OFFLINE": ("DEAD", "OFFLINE", None, False),
         "FAILED": ("RED", "FAULT", None, False),

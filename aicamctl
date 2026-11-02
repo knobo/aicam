@@ -42,6 +42,7 @@ def main():
                         "'gestures [off]', 'auto_frame [off]', "
                         "'draw [off]', 'tool <name>', 'ink <colour>', "
                         "'undo', 'erase', 'snapshot [path]', "
+                        "'record <out|green|alpha> [path]', 'record stop', "
                         "'window <title|off>', "
                         "'stop' or 'history'")
     p.add_argument("args", nargs="*",
@@ -110,6 +111,18 @@ def main():
         # aicam runs in its own working directory, so a relative path is made
         # absolute here. Without one, aicam names the file in ~/Pictures.
         msg = {"snapshot": os.path.abspath(a.args[0]) if a.args else True}
+    elif a.command == "record":
+        # record out|green|alpha [path], or record stop. Relative paths are made
+        # absolute for the same reason as a snapshot's.
+        mode = a.args[0] if a.args else "out"
+        if mode in ("stop", "off"):
+            msg = {"record": None}
+        elif mode not in ("out", "green", "alpha"):
+            sys.exit("aicamctl: record needs out, green, alpha or stop")
+        else:
+            msg = {"record": mode}
+            if len(a.args) > 1:
+                msg["path"] = os.path.abspath(a.args[1])
     elif a.command == "clear":
         msg = {"clear": True}
     else:
