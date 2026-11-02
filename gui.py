@@ -62,6 +62,7 @@ class Panel:
         self._suppress = False
         self.proc = None
         self.launching = False
+        self.aborted = False
         self.failed = False
         self.snapshot = None
         self.last_files = {}
@@ -389,6 +390,13 @@ class Panel:
         if self.connected:
             self.send({"quit": True})
             return
+        if self.launching and self.proc is not None and self.proc.poll() is None:
+            # Still loading its models: SIGTERM ends it at once, and once the
+            # loopback is open aicam treats it as a clean stop instead.
+            self.aborted = True
+            self.proc.terminate()
+            self.run_button.configure(text="◌ ABORTING", state="disabled")
+            return
         here = os.path.dirname(os.path.realpath(__file__))
         # The venv has mediapipe; the interpreter running the panel may not.
         venv = os.path.join(here, ".venv", "bin", "python")
@@ -403,7 +411,8 @@ class Panel:
         self.progress.configure(value=0)
         self.stage.configure(text="starting Python and CUDA…", foreground=hud.MUTED)
         self._show_boot(True)
-        self.run_button.configure(text="◌ SPINNING UP", state="disabled", color=hud.AMBER)
+        self.aborted = False
+        self.run_button.configure(text="✕ ABORT START", state="normal", color=hud.AMBER)
         self.header.show("BOOTING", "starting aicam…")
 
     def _show_boot(self, on):
@@ -620,7 +629,19 @@ class Panel:
 
     # ---------------------------------------------------------------- polling
 
+    def _in_box(self, box):
+        """Whether the user is in `box`. focus_get() raises KeyError while any
+        combobox list is open - Tk names the popdown, tkinter has no widget for
+        it - and a list being open means a box is in use."""
+        try:
+            return self.root.focus_get() is box
+        except KeyError:
+            return True
+
     def refresh(self):
+        # Scheduled first: an exception further down must not end the poll and
+        # leave the panel stuck on whatever it last showed.
+        self.root.after(500, self.refresh)
         reply = self.send({"query": "state"})
         if reply and reply.get("ok"):
             state = reply.get("state", {})
@@ -645,12 +666,12 @@ class Panel:
             self.mirror.set(bool(state.get("mirror")))
             self.gestures.set(bool(state.get("gestures")))
             self.auto_frame.set(bool(state.get("auto_frame")))
-            if self.root.focus_get() is not self.layer_box:
+            if not self._in_box(self.layer_box):
                 self.overlay_layer.set(state.get("overlay_layer", "front"))
             self.draw.set(bool(state.get("draw")))
-            if self.root.focus_get() is not self.ink_box:
+            if not self._in_box(self.ink_box):
                 self.ink.set(state.get("ink", "yellow"))
-            if self.root.focus_get() is not self.tool_box:
+            if not self._in_box(self.tool_box):
                 self.tool.set(state.get("tool", "pen"))
             background = state.get("background")
             self.background_label.configure(
@@ -694,7 +715,8 @@ class Panel:
             elif not alive:
                 if self.proc is not None:
                     self.launching = False
-                    if self.proc.returncode == 0:
+                    if self.proc.returncode == 0 or self.aborted:
+                        self.aborted = False
                         self._show_boot(False)
                     else:
                         # Its last words say why: no CUDA, wedged loopback, out of
@@ -715,7 +737,6 @@ class Panel:
                 else:
                     self.header.show("OFFLINE", "no aicam running")
                 self.telemetry.show(None, ())
-        self.root.after(500, self.refresh)
 
     @staticmethod
     def _info(state):

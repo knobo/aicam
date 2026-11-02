@@ -590,6 +590,21 @@ def main():
     except (FileNotFoundError, ValueError, RuntimeError) as exc:
         sys.exit(f"aicam: {exc}")
 
+    # Until here a signal kills at once, which is what the panel's ABORT wants
+    # while the models load. From the sink on it must go through `stop`: a
+    # killed ffmpeg leaves the loopback device wedged.
+    stop = False
+
+    def handle_signal(*_):
+        nonlocal stop
+        stop = True
+
+    try:
+        signal.signal(signal.SIGINT, handle_signal)
+        signal.signal(signal.SIGTERM, handle_signal)
+    except ValueError:
+        pass    # not the main thread; the caller owns shutdown
+
     sink = open_sink(args.output, width, height, args.fps)
     # ffmpeg takes over a second to fail against a wedged loopback device, so a
     # shorter check lets it through and we crash later on the first write.
@@ -653,7 +668,6 @@ def main():
     # RVM is recurrent: the state carried between frames is what keeps the matte
     # steady over time instead of shimmering around hair and shoulders.
     rec = [None] * 4
-    stop = False
     muted = False
     panel = None            # the window being held in the frame, if any
     mirror = args.mirror
@@ -688,15 +702,6 @@ def main():
         muted = on
         events.add("mute: on" if on else "mute: off")
 
-    def handle_signal(*_):
-        nonlocal stop
-        stop = True
-
-    try:
-        signal.signal(signal.SIGINT, handle_signal)
-        signal.signal(signal.SIGTERM, handle_signal)
-    except ValueError:
-        pass    # not the main thread; the caller owns shutdown
 
     def start(name):
         if name in SCENES:
