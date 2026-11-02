@@ -64,6 +64,7 @@ class Panel:
         self.launching = False
         self.failed = False
         self.snapshot = None
+        self.last_files = {}
         self.fps_history = collections.deque(maxlen=50)
 
         hud.setup(root)
@@ -643,18 +644,21 @@ class Panel:
             fps = hud.num(state.get("fps"))
             if fps is not None:
                 self.fps_history.append(fps)
-            self.header.show("MUTED" if state.get("muted") else "LIVE", self._info(state))
+            self.header.show("MUTED" if state.get("muted") else
+                             "REC" if state.get("recording") else "LIVE", self._info(state))
             self.telemetry.show(state, self.fps_history)
             self.events.show(state.get("events"))
             scenes = state.get("scenes")
             for name in scenes if isinstance(scenes, list) else ():
                 if name in self.tiles:
                     self.tiles[name].flash()
-            snapshot = state.get("last_snapshot")
-            if isinstance(snapshot, str) and snapshot != self.snapshot:
-                self.snapshot = snapshot
-                self.snapshot_link.configure(text=f"▣ {os.path.basename(snapshot)}  ↗")
-                self.snapshot_link.grid()
+            # One link, to whichever file aicam wrote last: a snapshot or a recording.
+            for key, icon in (("last_snapshot", "▣"), ("last_recording", "●")):
+                path = state.get(key)
+                if isinstance(path, str) and path != self.last_files.get(key):
+                    self.last_files[key] = self.snapshot = path
+                    self.snapshot_link.configure(text=f"{icon} {os.path.basename(path)}  ↗")
+                    self.snapshot_link.grid()
         else:
             self.capture_button.configure(state="disabled")
             alive = self.proc is not None and self.proc.poll() is None

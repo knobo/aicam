@@ -226,13 +226,13 @@ def _xdg_pictures():
                           text=True, check=True, timeout=2).stdout
 
 
-def pictures_dir(run=_xdg_pictures):
+def pictures_dir(run=_xdg_pictures, fallback="~/Pictures"):
     """Where a snapshot goes when no path was given: where the desktop keeps pictures."""
     try:
         found = run().strip()
     except (OSError, subprocess.SubprocessError):
         found = ""
-    directory = found or os.path.expanduser("~/Pictures")
+    directory = found or os.path.expanduser(fallback)
     try:
         os.makedirs(directory, exist_ok=True)
     except OSError:
@@ -240,7 +240,7 @@ def pictures_dir(run=_xdg_pictures):
     return directory
 
 
-def open_new_snapshot(directory, now=None):
+def open_new_snapshot(directory, now=None, suffix=".png"):
     """aicam-<time>.png in `directory`, opened for writing, never one that exists.
 
     Exclusive create rather than an exists() check: two snapshots in the same
@@ -250,7 +250,7 @@ def open_new_snapshot(directory, now=None):
     n = 1
     while True:
         try:
-            return open(stem + (f"-{n}" if n > 1 else "") + ".png", "xb")
+            return open(stem + (f"-{n}" if n > 1 else "") + suffix, "xb")
         except FileExistsError:
             n += 1
 
@@ -270,6 +270,107 @@ def save_snapshot(rgb, target, done, warn, run=_xdg_pictures):
         done(f.name)
     except (OSError, ValueError, cv2.error) as exc:
         warn(f"snapshot failed: {exc}")
+
+
+# ---------------------------------------------------------------- recording
+
+# out: what the loopback gets. green: you alone on #00FF00, for a chroma key.
+# alpha: you alone with a real alpha channel - VP9 in WebM, ~100 MB a minute,
+# which OBS's media source and browsers play transparent. ProRes 4444 was
+# measured at ~5 GB a minute, which is no use for a loop you keep.
+RECORD_MODES = {"out": ".mp4", "green": ".mp4", "alpha": ".webm"}
+GREEN = (0.0, 1.0, 0.0)
+
+
+def _xdg_videos():
+    return subprocess.run(["xdg-user-dir", "VIDEOS"], capture_output=True,
+                          text=True, check=True, timeout=2).stdout
+
+
+def record_command(mode, path, width, height, fps):
+    """ffmpeg reading raw frames on stdin and encoding them for `mode`.
+
+    Timestamps come from the wall clock and the output is resampled to a
+    constant `fps`, so a stretch where aicam ran slow still plays back at the
+    speed it happened - a loop of you must not look sped up.
+    """
+    # niced: the encoder takes every core it can get, and the camera must keep its 30 fps.
+    cmd = ["nice", "-n", "10", "ffmpeg", "-hide_banner", "-loglevel", "error",
+           "-f", "rawvideo", "-use_wallclock_as_timestamps", "1",
+           "-pix_fmt", "rgba" if mode == "alpha" else "rgb24",
+           "-s", f"{width}x{height}", "-i", "-",
+           "-fps_mode", "cfr", "-r", str(fps)]
+    if mode == "alpha":
+        # Realtime VP9 measured 3.5x faster than 30 fps at 1080p.
+        cmd += ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-deadline", "realtime",
+                "-cpu-used", "8", "-row-mt", "1", "-b:v", "0", "-crf", "32"]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                "-pix_fmt", "yuv420p", "-movflags", "+faststart"]
+    return cmd + ["-y", path]
+
+
+def record_frame(mode, fgr, pha):
+    """The subject alone, for the modes that leave the room out. Straight
+    (not premultiplied) colour under the alpha, which is what VP9 carries."""
+    if mode == "alpha":
+        return torch.cat([fgr, pha], dim=1)
+    green = torch.tensor(GREEN, device=fgr.device, dtype=fgr.dtype).view(1, 3, 1, 1)
+    return fgr * pha + green * (1 - pha)
+
+
+def to_host(frame):
+    """(1, C, H, W) floats in 0..1 on the GPU -> (H, W, C) uint8 on the host."""
+    frame = (frame.clamp(0, 1) * 255).round().to(torch.uint8)
+    return frame[0].permute(1, 2, 0).contiguous().cpu().numpy()
+
+
+class Recorder:
+    """ffmpeg fed from its own thread, like the preview, but a recording should
+    not lose frames to a hiccup: two seconds are queued before any is dropped.
+    The camera never waits on the encoder."""
+
+    def __init__(self, mode, path, width, height, fps, warn):
+        if mode not in RECORD_MODES:
+            raise ValueError(f"unknown record mode {mode!r}")
+        self.mode, self.path, self.warn = mode, path, warn
+        self.dropped = 0
+        self.proc = subprocess.Popen(record_command(mode, path, width, height, fps),
+                                     stdin=subprocess.PIPE)
+        self._frames = queue.Queue(maxsize=2 * fps)
+        self._pump_thread = threading.Thread(target=self._pump, daemon=True)
+        self._pump_thread.start()
+
+    def _pump(self):
+        while (frame := self._frames.get()) is not None:
+            try:
+                self.proc.stdin.write(frame)
+            except (OSError, ValueError):
+                self.warn(f"recording stopped: ffmpeg exited ({self.path})")
+                return
+
+    def write(self, frame):
+        try:
+            self._frames.put_nowait(frame.tobytes())
+        except queue.Full:
+            if self.dropped == 0:
+                self.warn("recording falls behind, dropping frames")
+            self.dropped += 1
+
+    def close(self):
+        """Blocks until ffmpeg has written the file; call it off the render loop."""
+        self._frames.put(None)
+        self._pump_thread.join(timeout=30)
+        close_pipe(self.proc, timeout=30)
+
+
+def new_recording_path(mode, target, run=_xdg_videos):
+    """`target` if a path was given, else aicam-<time> in the desktop's videos dir."""
+    if isinstance(target, str):
+        return target
+    with open_new_snapshot(pictures_dir(run, fallback="~/Videos"),
+                           suffix=RECORD_MODES[mode]) as f:
+        return f.name
 
 
 # ------------------------------------------------------- live control messages
@@ -522,6 +623,18 @@ def main():
         last_snapshot = path
         events.add(f"snapshot: {os.path.basename(path)}")
 
+    recorder = None         # a Recorder while a recording runs
+    last_recording = None
+
+    def stop_recording():
+        nonlocal recorder
+        if recorder is None:
+            return
+        rec_, recorder = recorder, None
+        events.add(f"record: stopped {os.path.basename(rec_.path)}")
+        # ffmpeg drains its queue and writes the moov atom; that is seconds, not a frame.
+        threading.Thread(target=rec_.close, daemon=True).start()
+
     pool = particles.ParticleSystem(device, capacity=args.particles)
     canvas = drawing.Canvas(device)
     draw_mode = False
@@ -668,6 +781,18 @@ def main():
                             events.add(f"trigger: {msg['trigger']}")
                         if msg.get("snapshot"):
                             snapshot = msg["snapshot"]
+                        if "record" in msg:
+                            stop_recording()
+                            mode = msg["record"]
+                            if mode:
+                                try:
+                                    path = new_recording_path(mode, msg.get("path"))
+                                    recorder = Recorder(mode, path, width, height,
+                                                        args.fps, warn)
+                                    last_recording = path
+                                    events.add(f"record: {mode} {os.path.basename(path)}")
+                                except (KeyError, ValueError, OSError) as exc:
+                                    warn(f"record failed: {exc}")
                         if msg.get("clear"):
                             active.clear()
                             pool.alive[:] = False
@@ -879,8 +1004,14 @@ def main():
                     out = framer.apply(out, pha, settings["frame_zoom"])
                 budget.lap("light")        # front overlay, studio light, auto-frame
 
-                out = (out.clamp(0, 1) * 255).round().to(torch.uint8)
-                out = out[0].permute(1, 2, 0).contiguous().cpu().numpy()
+                out = to_host(out)
+                if recorder is not None:
+                    if recorder.mode == "out":
+                        recorder.write(out)
+                    else:
+                        # Muted means no subject: an empty, all-green or clear frame.
+                        recorder.write(to_host(record_frame(
+                            recorder.mode, fgr, torch.zeros_like(pha) if muted else pha)))
                 budget.lap("transfer")
 
                 # Exactly what the loopback gets. `out` is a fresh array every
@@ -942,6 +1073,8 @@ def main():
                             "variant": args.variant,
                             "events": events.recent(),
                             "last_snapshot": last_snapshot,
+                            "recording": recorder.mode if recorder else None,
+                            "last_recording": last_recording,
                             **settings,
                         }
 
@@ -959,6 +1092,8 @@ def main():
         if server is not None:
             server.close()
         close_pipe(sink)
+        if recorder is not None:
+            recorder.close()    # here it may block: the file must be finished
         if preview is not None:
             preview.close()
     print("\naicam: stopped", file=sys.stderr)

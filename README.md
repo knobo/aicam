@@ -523,8 +523,19 @@ Everything is reachable at runtime over that socket:
 ./aicamctl gestures off               # stop reactions, keep hand tracking
 ./aicamctl auto_frame
 ./aicamctl snapshot                   # the output frame, as a PNG in ~/Pictures
+./aicamctl record                     # record what the meeting sees, to ~/Videos
+./aicamctl record green [file.mp4]    # you alone on #00FF00, for a chroma key
+./aicamctl record alpha [file.webm]   # you alone, transparent (VP9)
+./aicamctl record stop
 ./aicamctl stop                       # shut the pipeline down cleanly
 ```
+
+A recording has no sound and plays back at the speed it happened, even where
+aicam ran slower than 30 fps. `green` and `alpha` leave out the background,
+particles and overlays, so the clip can be laid over anything afterwards: an
+OBS media source plays the VP9 alpha transparent as it is, and `aicam --input
+file.mp4` plays any of them back as the camera (without the transparency).
+`alpha` is around 100 MB a minute at 1080p.
 
 Overlay, its layer and the background can all be swapped while the pipeline is
 running; the GUI has controls for each. Moving a clip between layers keeps it
