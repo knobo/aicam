@@ -143,6 +143,17 @@ class Panel:
                 padx=(0 if i % 3 == 0 else 4, 0), pady=(0, 3))
             box.columnconfigure(i % 3, weight=1, uniform="toggle")
 
+        box = self._section(body, "RECORD")
+        box.columnconfigure(1, weight=1)
+        self.record_mode = tk.StringVar(value="out")
+        self.recording = None
+        self._label(box, "MODE").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self._combo(box, self.record_mode, ["out", "green", "alpha"]).grid(
+            row=0, column=1, sticky="ew", padx=(0, 8))
+        self.record_button = hud.Button(box, "● RECORD", self.toggle_record, color=hud.RED)
+        self.record_button.configure(width=hud.px(130), state="disabled")
+        self.record_button.grid(row=0, column=2, sticky="ew")
+
         box = self._section(body, "DRAW IN THE AIR")
         box.columnconfigure((1, 3), weight=1)
         hud.Button(box, "UNDO", lambda: self.send({"undo": True})).grid(
@@ -405,6 +416,10 @@ class Panel:
         if self.send({"snapshot": True}) is not None:
             self.header.shutter()
 
+    def toggle_record(self):
+        """Start in the chosen mode, or stop; the label follows aicam's state."""
+        self.send({"record": None if self.recording else self.record_mode.get()})
+
     def open_snapshot(self):
         if self.snapshot and shutil.which("xdg-open"):
             subprocess.Popen(["xdg-open", self.snapshot])
@@ -621,6 +636,7 @@ class Panel:
             # Same rule as the sliders: do not overwrite a box the user is in.
             self.run_button.configure(text="■ DISENGAGE", state="normal", color=hud.RED)
             self.capture_button.configure(state="normal")
+            self.record_button.configure(state="normal")
             if self.launching or self.failed:
                 self.launching = self.failed = False
                 self._show_boot(False)
@@ -652,6 +668,11 @@ class Panel:
             for name in scenes if isinstance(scenes, list) else ():
                 if name in self.tiles:
                     self.tiles[name].flash()
+            recording = state.get("recording")
+            if recording != self.recording:
+                self.recording = recording
+                self.record_button.configure(
+                    text=f"■ STOP {recording.upper()}" if recording else "● RECORD")
             # One link, to whichever file aicam wrote last: a snapshot or a recording.
             for key, icon in (("last_snapshot", "▣"), ("last_recording", "●")):
                 path = state.get(key)
@@ -661,6 +682,7 @@ class Panel:
                     self.snapshot_link.grid()
         else:
             self.capture_button.configure(state="disabled")
+            self.record_button.configure(state="disabled")
             alive = self.proc is not None and self.proc.poll() is None
             if alive and self.launching:
                 # Still booting while a launch we made is loading its model.
