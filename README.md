@@ -62,7 +62,7 @@ What it does, in one list:
 ## Install
 
 ```sh
-git clone <your fork> aicam && cd aicam
+git clone https://github.com/knobo/aicam.git && cd aicam
 python3 -m venv --system-site-packages .venv
 .venv/bin/pip install torch opencv-python-headless numpy timm
 
