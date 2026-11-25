@@ -217,7 +217,7 @@ def open_background(path, device, dtype, width=None, height=None, fps=30):
     The file type is settled by trying to decode it, not by its extension, so a
     .png that is really a clip - or the reverse - still works. A screen grab is
     named rather than decoded: `desktop`, `desktop:HDMI-4`, `desktop:left`,
-    `desktop:window:youtube`.
+    `desktop:window:youtube`. So are the rendered shapes: `shapes`, `shapes:dusk`.
     """
     import streams
 
@@ -226,6 +226,10 @@ def open_background(path, device, dtype, width=None, height=None, fps=30):
         # what we resolve again each time the stream runs out.
         return VideoBackground(streams.resolve(path), device, dtype, path=path,
                                reopen=lambda: streams.resolve(path))
+
+    import shapes3d
+    if shapes3d.is_shapes_spec(path):
+        return shapes3d.ShapesBackground(path, device, dtype)
 
     if desktop_module().is_desktop_spec(path):
         if not width or not height:

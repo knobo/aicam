@@ -21,9 +21,22 @@ HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
 
 import control  # noqa: E402
+import history  # noqa: E402
 import hud  # noqa: E402
+import settings  # noqa: E402
 
 BACKGROUNDS = os.path.join(HERE, "backgrounds")
+# shapes3d.PALETTES, spelled out: importing it would load torch into the panel.
+# tests/test_shapes.py keeps the two in step.
+# Spec, tile label, glyph, and whether the tile wears the warm status colour.
+# Three to a row; the second row is the seasons, and SEASON is whichever of
+# them the calendar says, or the gold between them.
+SHAPES = [("shapes", "3D GOLD", "◆", True),
+          ("shapes:dusk", "3D DUSK", "◈", False),
+          ("shapes:studio", "3D STUDIO", "◇", False),
+          ("shapes:christmas", "3D CHRISTMAS", "❄", False),
+          ("shapes:easter", "3D EASTER", "✿", False),
+          ("shapes:season", "3D SEASON", "◷", False)]
 IMAGE_OR_VIDEO = ("*.jpg", "*.jpeg", "*.png", "*.webp",
                   "*.mp4", "*.mov", "*.mkv", "*.webm", "*.gif", "*.avi")
 VIDEO = ("*.mp4", "*.mov", "*.mkv", "*.webm", "*.gif", "*.avi")
@@ -209,6 +222,15 @@ class Panel:
                                          font=hud.font(11), anchor="w")
         self.background_label.grid(row=0, column=0, columnspan=3, sticky="ew",
                                    pady=(0, 4))
+        # The rendered shapes first and as big as the reactions: one click,
+        # no menu, and the one background here that needs no file at all.
+        for i, (spec, label, glyph, warm) in enumerate(SHAPES):
+            column = i % 3
+            hud.Button(box, label, lambda spec=spec: self.send({"background": spec}),
+                       glyph=glyph, height=46, color=hud.AMBER if warm else None).grid(
+                row=1 + i // 3, column=column, sticky="ew",
+                padx=(0 if column == 0 else 4, 0), pady=(0, 4))
+        first = 1 + (len(SHAPES) + 2) // 3
         for row, buttons in enumerate([
                 [("BUNDLED…", self.pick_bundled, 1),
                  ("IMAGE/VIDEO…", self.pick_background, 1),
@@ -216,7 +238,7 @@ class Panel:
                 [("HOLD A WINDOW…", lambda: self.pick_desktop(hold=True), 2),
                  ("DROP", lambda: self.send({"window": None}), 1)],
                 [("SCREEN OR WINDOW…", self.pick_desktop, 2),
-                 ("RECENT…", self.pick_recent, 1)]], start=1):
+                 ("RECENT…", self.pick_recent, 1)]], start=first):
             column = 0
             for text, command, span in buttons:
                 hud.Button(box, text, command).grid(
@@ -224,12 +246,14 @@ class Panel:
                     padx=(0 if column == 0 else 4, 0), pady=(0, 4))
                 column += span
         self._label(box, "STREAM A URL · YouTube or a direct video link").grid(
-            row=4, column=0, columnspan=3, sticky="w", pady=(1, 1))
+            row=row + 1, column=0, columnspan=3, sticky="w", pady=(1, 1))
         self.url = tk.StringVar()
         entry = ttk.Entry(box, textvariable=self.url, font=hud.font(12))
-        entry.grid(row=5, column=0, columnspan=2, sticky="ew", padx=(0, 4))
+        entry.grid(row=row + 2, column=0, columnspan=2, sticky="ew", padx=(0, 4))
         entry.bind("<Return>", lambda _e: self.use_url())
-        hud.Button(box, "PASTE URL", self.use_url).grid(row=5, column=2, sticky="ew")
+        hud.Button(box, "PASTE URL", self.use_url).grid(row=row + 2, column=2, sticky="ew")
+
+        self._startup_section(body)
 
         box = self._section(body, "EVENT LOG")
         box.columnconfigure(0, weight=1)
@@ -241,6 +265,119 @@ class Panel:
         self.wheel_scrolling(root)
         self.refresh()
         self.animate()
+
+    def _startup_section(self, body):
+        """What aicam starts with: ~/.config/aicam/settings.json, edited here.
+
+        Saved on every change. Nothing is sent to a running aicam - the
+        toggles under SYSTEMS are for now, these are for next time.
+        """
+        box = self._section(body, "STARTUP DEFAULTS")
+        box.columnconfigure((1, 3), weight=1)
+        saved = settings.load()
+        self._label(box, "applied at the next ENGAGE · flags on the command line win").grid(
+            row=0, column=0, columnspan=4, sticky="w", pady=(0, 3))
+
+        toggles = tk.Frame(box, bg=hud.BG)
+        toggles.grid(row=1, column=0, columnspan=4, sticky="ew")
+        self.startup = {}
+        for i, (key, text) in enumerate(settings.TOGGLES):
+            var = tk.BooleanVar(value=saved.get(key, settings.DEFAULTS[key]))
+            self.startup[key] = var
+            hud.Toggle(toggles, text, var, lambda k=key: self._save_startup(k)).grid(
+                row=i // 3, column=i % 3, sticky="ew",
+                padx=(0 if i % 3 == 0 else 4, 0), pady=(0, 3))
+            toggles.columnconfigure(i % 3, weight=1, uniform="startup")
+
+        self.startup_mode = tk.StringVar(value=saved.get("mode", settings.DEFAULTS["mode"]))
+        self._label(box, "MODE").grid(row=2, column=0, sticky="w", padx=(0, 6), pady=(2, 0))
+        mode = self._combo(box, self.startup_mode, ["blur", "cinematic"])
+        mode.grid(row=2, column=1, sticky="ew", padx=(0, 8), pady=(2, 0))
+        mode.bind("<<ComboboxSelected>>", lambda _e: self._save_startup("mode"))
+
+        self.startup_background = tk.StringVar()
+        self._label(box, "BACKDROP").grid(row=2, column=2, sticky="w", padx=(0, 6), pady=(2, 0))
+        self.startup_background_box = backdrop = self._combo(box, self.startup_background, [])
+        backdrop.grid(row=2, column=3, sticky="ew", pady=(2, 0))
+        # Filled when it opens, so a background added since is in the list.
+        backdrop.configure(postcommand=self._fill_startup_backgrounds)
+        backdrop.bind("<<ComboboxSelected>>", lambda _e: self._save_startup("background"))
+        self._fill_startup_backgrounds()
+        self._show_startup_background(saved.get("background"))
+
+        hud.Button(box, "USE WHAT IS RUNNING NOW", self.startup_from_running).grid(
+            row=3, column=0, columnspan=3, sticky="ew", padx=(0, 4), pady=(4, 0))
+        hud.Button(box, "RESET", self.reset_startup, color=hud.AMBER).grid(
+            row=3, column=3, sticky="ew", pady=(4, 0))
+
+    def startup_backgrounds(self):
+        """(label, source) for the BACKDROP list: none, the 3D shapes, what is
+        in backgrounds/, then whatever was used recently."""
+        choices = [("none", None)] + [(label.lower(), spec) for spec, label, _, _ in SHAPES]
+        suffixes = tuple(pattern[1:] for pattern in IMAGE_OR_VIDEO)
+        try:
+            names = sorted((n for n in os.listdir(BACKGROUNDS)
+                            if n.lower().endswith(suffixes)), key=str.lower)
+        except OSError:
+            names = []
+        choices += [(os.path.splitext(n)[0], os.path.join(BACKGROUNDS, n)) for n in names]
+        known = {source for _, source in choices}
+        for entry in history.load():
+            if entry["source"] not in known:
+                choices.append((history.label(entry["source"]), entry["source"]))
+                known.add(entry["source"])
+        saved = settings.load().get("background")
+        if saved not in known:
+            choices.append((history.label(saved), saved))
+        return choices
+
+    def _fill_startup_backgrounds(self):
+        self._backdrops = self.startup_backgrounds()
+        self.startup_background_box.configure(values=[label for label, _ in self._backdrops])
+
+    def _show_startup_background(self, source):
+        for label, candidate in self._backdrops:
+            if candidate == source:
+                self.startup_background.set(label)
+                return
+        self.startup_background.set(history.label(source) if source else "none")
+
+    def _save_startup(self, key):
+        if key == "mode":
+            value = self.startup_mode.get()
+        elif key == "background":
+            labels = dict(self._backdrops)
+            value = labels.get(self.startup_background.get())
+        else:
+            value = self.startup[key].get()
+        settings.update({key: value})
+
+    def _load_startup(self):
+        """Redraw the section from the file."""
+        saved = settings.load()
+        for key, var in self.startup.items():
+            var.set(saved.get(key, settings.DEFAULTS[key]))
+        self.startup_mode.set(saved.get("mode", settings.DEFAULTS["mode"]))
+        self._fill_startup_backgrounds()
+        self._show_startup_background(saved.get("background"))
+
+    def startup_from_running(self):
+        """Make what aicam is doing now - toggles, look, background, ink - the
+        way it starts next time. Needs a running aicam to ask."""
+        reply = self.send({"query": "state"})
+        state = reply.get("state", {}) if reply and reply.get("ok") else None
+        if state is None:
+            self.header.show("OFFLINE", "start aicam first: there is nothing to copy")
+            return
+        # The state calls the face guard nothing, so it keeps its saved value.
+        changes = {k: state[k] for k in settings.KEYS if k in state}
+        settings.update(settings.clean(changes) | {"background": state.get("background")})
+        self._load_startup()
+
+    def reset_startup(self):
+        """Back to aicam's built-in defaults, by emptying the file."""
+        settings.save({})
+        self._load_startup()
 
     def _section(self, body, title):
         """A titled block in the scrolling body; returns the frame to fill."""
@@ -402,6 +539,8 @@ class Panel:
         venv = os.path.join(here, ".venv", "bin", "python")
         cmd = [venv if os.path.exists(venv) else sys.executable,
                os.path.join(here, "aicam.py")]
+        # Nothing else is passed: ~/.config/aicam/settings.json, which the
+        # STARTUP DEFAULTS section edits, is what aicam reads for the rest.
         if self.socket_path:
             cmd += ["--socket", self.socket_path]
         with open(LOG, "w") as log:

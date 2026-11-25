@@ -120,6 +120,56 @@ X11 only, deliberately. Wayland routes screen capture through the desktop portal
 and PipeWire, which is a different mechanism rather than a different flag, and
 guessing at it would produce a black rectangle with no explanation.
 
+## Rendered shapes as a background
+
+`--background shapes` (or `shapes:dusk`, `shapes:studio`) renders a handful of
+floating polyhedra every frame, in `shapes3d.py`. No meshes and no raymarching:
+a convex polyhedron is the intersection of half spaces, so a ray hits it where
+the last plane it enters comes before the first plane it leaves. A hollow shape
+is its frame, one convex piece per edge (the part of the solid within a width of
+both faces meeting there), and the ray takes the nearest piece. Pieces overlap
+inside the solid at the corners, so the joints come out mitred for free.
+
+Two of the shapes are the aperiodic monotiles from 2023, the hat and the
+spectre: tiles that cover the plane but never in a repeating pattern. Both are
+Tile(a, b) from the paper, a 14-gon traced as a turtle; the tests check the hat
+is eight kites with thirteen sides and the spectre fourteen equal edges. They are
+not convex, so they are cut into convex parts (ear clipping, then merging
+neighbours while the result stays convex) and extruded into slabs. A hollow tile
+is its outline as a thin rod, one mitred bar per edge.
+
+Cuts between parts must not be bevelled, or they show as seams, so each plane
+carries a second offset that the bevel sees, pushed out of reach for a cut. The
+hat has two collinear edges, and the first decomposition tried continued a cut
+straight on from one of them: one plane, half outline and half cut, which can be
+neither. Every starting vertex is tried and a decomposition without such a side
+kept. The bevel is also much tighter on the tiles: the softmax has a tail, and on
+a part only a few bevels wide it tilted the whole top, each part its own way.
+
+What makes it look like an object rather than a polygon is the normal: a softmax
+over the piece's plane distances, which shades the hard edges as if bevelled and
+gives them a line of light. Metal reflects a mostly dark studio with softboxes in
+it; a bright even surround made the gold look like satin brass.
+
+Measured at 1080p on the 4070 SUPER, with 13 shapes (the default is now 7):
+
+| implementation                         | per frame | startup  |
+|----------------------------------------|-----------|----------|
+| torch, op by op                        | 32 ms     | -        |
+| the same under `torch.compile`         | 7 ms      | 13-42 s  |
+| one Triton kernel, ray to colour       | 1.0 ms    | ~0.3 s   |
+
+The whole background, with physics, wall, shadows and compositing, is about
+3 ms. Op by op the cost was memory traffic, dozens of passes over patches of
+tens of megabytes; the kernel keeps each pixel in registers. The torch version
+stays, for the CPU and as the reference a test holds the kernel to.
+
+The shapes keep clear of you through the matte, pooled to 96x54 and blurred on
+the GPU. Only that grid crosses to the CPU, where the physics for a handful of bodies
+is plain numpy: the field's gradient pushes a shape away, and the field rising
+under a shape - you moving into it - gives it an extra kick, which is what turns
+leaning sideways into the shapes bouncing off.
+
 ## Background replacement that understands depth
 
 A matte only knows "person" and "not person". Hold up a book and it vanishes the

@@ -49,7 +49,9 @@ def main():
                    help="for 'set': key=value pairs. For 'overlay' and 'background': "
                         "a file, a URL, yt:<youtube url>, '@2' from the history, "
                         "or 'off'. For 'background' also desktop, desktop:HDMI-4, "
-                        "desktop:left, desktop:window:<title>")
+                        "desktop:left, desktop:window:<title>, and shapes, "
+                        "shapes:dusk, shapes:studio, shapes:christmas, shapes:easter, "
+                        "shapes:season for rendered 3D shapes")
     p.add_argument("--layer", choices=["front", "back"],
                    help="overlay: front of you, or behind you in the background")
     p.add_argument("--mode", choices=["luma", "chroma"], default="luma",

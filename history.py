@@ -22,9 +22,11 @@ def default_path():
 
 
 def kind_of(source):
-    """desktop, stream, url or file - what the menu needs to know."""
+    """desktop, 3d, stream, url or file - what the menu needs to know."""
     if source.startswith("desktop"):
         return "desktop"
+    if source == "shapes" or source.startswith("shapes:"):
+        return "3d"
     if source.startswith("yt:"):
         return "stream"
     if "://" in source:

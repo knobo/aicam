@@ -46,6 +46,11 @@ What it does, in one list:
 - **Cinematic mode** - depth-graded bokeh and studio lighting, not a flat blur
 - **Background replacement** that still lets through whatever you hold up
 - **Your screen, a window, a video or a YouTube link** as the background
+- **Rendered 3D shapes** as the background: polished gold and lacquer, solid or
+  hollow frames, among them the hat and the spectre, the aperiodic monotiles,
+  drifting around and moving out of your way when you move - and in season,
+  presents, gingerbread men, a nisse and a reindeer in the snow, or eggs and
+  chicks at Easter
 - **Draw in the air** with your finger, and the ink keeps the depth you drew it at
 - **Hand gestures** to fire any of it, plus a Tk panel and a CLI for when they misfire
 - **Auto-framing** and a virtual camera move, from one still camera
@@ -174,6 +179,38 @@ together, which is what Tk will tell you if you ask it. The wheel scrolls from
 anywhere on the panel, dropdowns included: ttk would otherwise let a scroll past
 the Tool list quietly change your tool.
 
+### Startup defaults
+
+What aicam starts with lives in `~/.config/aicam/settings.json`, and the
+panel's **STARTUP DEFAULTS** section edits it: preview, mirror, gestures,
+auto-frame and the face guard, the mode, and a background to start with.
+**USE WHAT IS RUNNING NOW** copies a running aicam into it, the sliders, ink
+and tool included, so you can tune the look in a call and keep it. **RESET**
+empties the file.
+
+The keys are the flags' own names with underscores, so the file is easy to
+write by hand too:
+
+```json
+{"mirror": true, "mode": "cinematic", "aperture": 55.0, "background": "shapes:dusk"}
+```
+
+The file only sets defaults: a flag on the command line still wins, which is
+why every switch also has a `--no-` form (`--no-preview`, `--no-mirror`).
+`--no-settings` ignores the file altogether. Keys aicam does not know and
+values of the wrong type are skipped rather than refused. A saved background
+that has gone away since, a deleted file or a closed window, starts the camera
+without one; the same background typed on the command line is an error.
+
+### Starting
+
+**AI Cam** is there for the meeting at once. The camera and the loopback
+device are opened before any model loads, and until the pipeline is ready the
+meeting sees a dark card that says *camera starting…* and which step it is on,
+instead of no camera at all for ten seconds. The card is drawn on the CPU at 10
+fps, about 0.6 ms a frame, so it does not hold up the models loading on the
+GPU. ABORT or Ctrl-C while it shows closes the loopback properly.
+
 ### Cinematic mode
 
 Defocus increases gradually with distance instead of switching at the silhouette,
@@ -253,6 +290,33 @@ the decoder as-is.
 
 For live viewing, capturing the screen it plays on is usually the better trade:
 no extraction, no expiry, and you keep play, pause and seek.
+
+### Seasonal 3D backgrounds
+
+```sh
+./aicam --background shapes:christmas     # presents, nisse, reindeer, sleigh, in the snow
+./aicam --background shapes:easter        # painted eggs, chicks, a hare, daffodils, an orange
+./aicam --background shapes:season       # whichever it is today, gold shapes in between
+```
+
+The same floating and dodging as the other 3D shapes, but the figures are
+ornaments: Christmas has presents in seven wrappings with ribbons and bows,
+gingerbread men with icing, a nisse, a red-nosed reindeer, a sleigh with a
+sack, a tree, baubles and a star, and it snows - flakes behind the figures and
+a few, bigger and softer, in front of them. Easter has eggs painted in bands and
+dots, chicks in their shells, a hare, daffodils and the obligatory orange.
+
+Figures that would look wrong upside down - the nisse, the tree, the reindeer,
+the hare - stand up: a knock turns them about the vertical and they rock a
+little, while presents, cookies and eggs tumble like the polyhedra.
+
+`shapes:season` is Christmas from the first Sunday of Advent to Epiphany
+(6 January), and Easter from two weeks before Easter Sunday to Easter Monday.
+Make it the startup background and the camera dresses for the season by itself.
+
+Each figure is a few dozen convex blocks and ellipsoids, each in its own
+material, traced like the other shapes. Christmas costs about 9 ms a frame at
+1080p, snow included, against 7 for the gold shapes.
 
 ### Your screen as the background
 

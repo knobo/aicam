@@ -120,11 +120,12 @@ def normalise_source(target):
 
     aicam runs in its own working directory, so a relative path has to be made
     absolute here. A URL and a desktop spec are names rather than paths, and
-    abspath would mangle both of them into nonsense.
+    abspath would mangle both of them into nonsense. So are the rendered shapes.
     """
     if target == "off":
         return None
-    if "://" in target or target.startswith("desktop"):
+    if "://" in target or target.startswith("desktop") or \
+            target == "shapes" or target.startswith("shapes:"):
         return target
     return os.path.abspath(target)
 

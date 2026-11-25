@@ -33,7 +33,9 @@ import drawing  # noqa: E402
 import effects  # noqa: E402
 import history  # noqa: E402
 import overlays  # noqa: E402
+import bootscreen  # noqa: E402
 import particles  # noqa: E402
+import settings as startup  # noqa: E402
 import telemetry  # noqa: E402
 from control import ControlServer  # noqa: E402
 from depth import DepthEstimator  # noqa: E402
@@ -450,10 +452,13 @@ def build_parser():
 
     p.add_argument("--mode", default="blur", choices=["blur", "cinematic"],
                    help="blur = uniform defocus; cinematic = depth-graded bokeh and studio light")
-    p.add_argument("--background", metavar="IMAGE|VIDEO|desktop",
-                   help="replace the background with an image, a video file, or the "
-                        "screen: desktop, desktop:HDMI-4, desktop:left, desktop:right, "
-                        "desktop:window:<title>")
+    p.add_argument("--background", metavar="IMAGE|VIDEO|desktop|shapes",
+                   help="replace the background with an image, a video file, the "
+                        "screen (desktop, desktop:HDMI-4, desktop:left, desktop:right, "
+                        "desktop:window:<title>), or rendered 3D shapes that keep "
+                        "clear of you (shapes, shapes:dusk, shapes:studio; shapes:christmas and "
+                        "shapes:easter for the seasons' figures, shapes:season to "
+                        "pick by the date)")
     p.add_argument("--blur", type=float, default=40.0, help="blur mode: background defocus")
 
     p.add_argument("--aperture", type=float, default=45.0,
@@ -512,6 +517,8 @@ def build_parser():
     p.add_argument("--particles", type=int, default=3000, help="particle pool size")
     p.add_argument("--socket", default=None, help="control socket path")
     p.add_argument("--no-control", action="store_true", help="do not open a control socket")
+    p.add_argument("--no-settings", action="store_true",
+                   help="ignore the startup defaults in ~/.config/aicam/settings.json")
 
     p.add_argument("--downsample", type=float, default=0.25,
                    help="resolution the matting model works at, as a fraction of full")
@@ -522,7 +529,8 @@ def build_parser():
     # Measured on an RTX 4070 SUPER at 1080p: fp32 ~149 fps, fp16 ~130 fps. The
     # model is too small for half precision to pay for its conversion cost.
     p.add_argument("--fp16", action="store_true", help="half precision (measured slower, halves VRAM)")
-    p.add_argument("--preview", action="store_true", help="show a window while running")
+    p.add_argument("--preview", action=argparse.BooleanOptionalAction, default=False,
+                   help="show a window while running")
     p.add_argument("--stats", action="store_true", help="print frame rate")
     return p
 
@@ -530,7 +538,16 @@ def build_parser():
 # ---------------------------------------------------------------- main
 
 def main():
-    args = build_parser().parse_args()
+    parser = build_parser()
+    used = {}
+    # Twice: once to learn whether to read the saved defaults at all, then for
+    # real with them in place, so a flag on the command line still wins.
+    if not parser.parse_known_args()[0].no_settings:
+        used = startup.apply(parser, startup.load())
+        if used:
+            print(f"aicam: startup defaults from {startup.default_path()}: "
+                  + ", ".join(sorted(used)), file=sys.stderr)
+    args = parser.parse_args()
     started = time.monotonic()
 
     if not args.no_control:
@@ -553,27 +570,10 @@ def main():
     device = torch.device("cuda")
     dtype = torch.float16 if args.fp16 else torch.float32
 
-    print(f"aicam: loading {args.variant} on {torch.cuda.get_device_name(0)}", file=sys.stderr)
-    matting = torch.hub.load("PeterL1n/RobustVideoMatting", args.variant, trust_repo=True)
-    matting = matting.eval().to(device, dtype)
-
-    depth_model = DepthEstimator(device, dtype)
-    print("aicam: loaded MiDaS_small for depth", file=sys.stderr)
-
-    detector = None
-    if args.gestures:
-        try:
-            from gestures import GestureDetector, GESTURE_SCENES
-            detector = GestureDetector(args.gesture_model, pinch_on=args.pinch,
-                                       hold=args.gesture_hold,
-                                       face_guard=args.gesture_face_guard)
-            print(f"aicam: gestures active ({', '.join(GESTURE_SCENES)})", file=sys.stderr)
-        except ImportError:
-            print("aicam: mediapipe not available, gestures off "
-                  "(use .venv/bin/python, or --no-gestures)", file=sys.stderr)
-        except Exception as exc:
-            print(f"aicam: gestures off ({exc})", file=sys.stderr)
-
+    # The camera and the loopback come first, before any model: the device then
+    # shows up in the meeting at once, with a card saying it is starting, rather
+    # than ten seconds later. Opening the camera is also the likeliest thing to
+    # fail, and better said before the wait than after it.
     try:
         cap, width, height = open_camera(args.input, args.width, args.height, args.fps)
     except RuntimeError as exc:
@@ -581,41 +581,97 @@ def main():
     if (width, height) != (args.width, args.height):
         print(f"aicam: camera gave {width}x{height}", file=sys.stderr)
 
-    try:
-        background_source = overlays.open_background(
-            args.background, device, dtype,
-            width=width, height=height, fps=args.fps) if args.background else None
-        if background_source is not None:
-            history.remember(args.background)
-    except (FileNotFoundError, ValueError, RuntimeError) as exc:
-        sys.exit(f"aicam: {exc}")
-
-    # Until here a signal kills at once, which is what the panel's ABORT wants
-    # while the models load. From the sink on it must go through `stop`: a
-    # killed ffmpeg leaves the loopback device wedged.
-    stop = False
-
-    def handle_signal(*_):
-        nonlocal stop
-        stop = True
-
-    try:
-        signal.signal(signal.SIGINT, handle_signal)
-        signal.signal(signal.SIGTERM, handle_signal)
-    except ValueError:
-        pass    # not the main thread; the caller owns shutdown
-
     sink = open_sink(args.output, width, height, args.fps)
     # ffmpeg takes over a second to fail against a wedged loopback device, so a
     # shorter check lets it through and we crash later on the first write.
     time.sleep(1.5)
     if sink.poll() is not None:
+        cap.release()
         sys.exit(
             f"aicam: ffmpeg could not open {args.output}.\n"
             "If it printed VIDIOC_G_FMT: Invalid argument, the loopback device is\n"
             "wedged. Reload the module:\n"
             "  sudo modprobe -r v4l2loopback && sudo modprobe v4l2loopback"
         )
+    boot = bootscreen.BootScreen(sink, width, height).start()
+
+    # From the sink on, nothing may kill ffmpeg outright: that leaves the
+    # loopback wedged. While loading, SIGTERM (the panel's ABORT) and Ctrl-C
+    # unwind through the except below, which closes it; in the loop they only
+    # set `stop`, and the loop closes it.
+    stop = False
+
+    def abort_boot(*_):
+        raise KeyboardInterrupt
+
+    def handle_signal(*_):
+        nonlocal stop
+        stop = True
+
+    def on_signals(handler):
+        try:
+            signal.signal(signal.SIGINT, handler)
+            signal.signal(signal.SIGTERM, handler)
+        except ValueError:
+            pass    # not the main thread; the caller owns shutdown
+
+    on_signals(abort_boot)
+    detector = background_source = None
+    try:
+        boot.say("loading the matting model")
+        print(f"aicam: loading {args.variant} on {torch.cuda.get_device_name(0)}", file=sys.stderr)
+        matting = torch.hub.load("PeterL1n/RobustVideoMatting", args.variant, trust_repo=True)
+        matting = matting.eval().to(device, dtype)
+
+        boot.say("loading depth")
+        depth_model = DepthEstimator(device, dtype)
+        print("aicam: loaded MiDaS_small for depth", file=sys.stderr)
+
+        if args.gestures:
+            boot.say("loading hand tracking")
+            try:
+                from gestures import GestureDetector, GESTURE_SCENES
+                detector = GestureDetector(args.gesture_model, pinch_on=args.pinch,
+                                           hold=args.gesture_hold,
+                                           face_guard=args.gesture_face_guard)
+                print(f"aicam: gestures active ({', '.join(GESTURE_SCENES)})", file=sys.stderr)
+            except ImportError:
+                print("aicam: mediapipe not available, gestures off "
+                      "(use .venv/bin/python, or --no-gestures)", file=sys.stderr)
+            except Exception as exc:
+                print(f"aicam: gestures off ({exc})", file=sys.stderr)
+
+        if args.background:
+            boot.say("opening the background")
+        try:
+            background_source = overlays.open_background(
+                args.background, device, dtype,
+                width=width, height=height, fps=args.fps) if args.background else None
+            if background_source is not None:
+                history.remember(args.background)
+        except (FileNotFoundError, ValueError, RuntimeError) as exc:
+            # A saved default that has gone away - a deleted file, a window that
+            # is closed today - is not worth a camera that will not start. One
+            # typed on the command line is: that was asked for just now.
+            if "background" not in used or args.background != used["background"]:
+                raise SystemExit(f"aicam: {exc}")
+            print(f"aicam: saved background unavailable, starting without it: {exc}",
+                  file=sys.stderr)
+            background_source = None
+    except BaseException as exc:
+        # Aborted or failed while loading: take the card down and close the
+        # loopback properly, so the next start does not find it wedged.
+        boot.stop()
+        close_pipe(sink)
+        cap.release()
+        if detector is not None:
+            detector.close()
+        if isinstance(exc, KeyboardInterrupt):
+            print("aicam: aborted while starting", file=sys.stderr)
+            sys.exit(0)
+        raise
+    on_signals(handle_signal)
+    boot.stop()
 
     preview = open_preview(width, height, args.fps) if args.preview else None
     server = None if args.no_control else ControlServer(args.socket)
@@ -901,6 +957,10 @@ def main():
                     else:
                         canvas.end()
 
+                # A rendered background that moves out of your way needs to know
+                # where you are, and this is the first point the matte exists.
+                if background_source is not None and hasattr(background_source, "observe"):
+                    background_source.observe(pha)
                 # A video background hands over a new frame here; a still one hands
                 # back the same tensor every time.
                 background = background_source.sample(height, width) \
