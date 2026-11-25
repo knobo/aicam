@@ -37,13 +37,15 @@ import bootscreen  # noqa: E402
 import particles  # noqa: E402
 import settings as startup  # noqa: E402
 import telemetry  # noqa: E402
+import weather  # noqa: E402
 from control import ControlServer  # noqa: E402
 from depth import DepthEstimator  # noqa: E402
 from scenes import SCENES  # noqa: E402
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 TUNABLE = {"aperture", "light", "rim", "highlights", "blur", "keep_near", "downsample",
-           "parallax", "parallax_period", "frame_zoom", "ink_width"}
+           "parallax", "parallax_period", "frame_zoom", "ink_width",
+           "weather_amount", "aurora", "shooting_stars"}
 
 
 # ---------------------------------------------------------------- input and output
@@ -458,7 +460,21 @@ def build_parser():
                         "desktop:window:<title>), or rendered 3D shapes that keep "
                         "clear of you (shapes, shapes:dusk, shapes:studio; shapes:christmas and "
                         "shapes:easter for the seasons' figures, shapes:season to "
-                        "pick by the date)")
+                        "pick by the date), or with nothing floating in them: "
+                        "shapes:snow, shapes:stars, shapes:aurora")
+    p.add_argument("--weather", default=None, choices=list(weather.KINDS),
+                   help="something falling through the picture, behind you and in "
+                        "front, whatever the background is")
+    p.add_argument("--weather-amount", type=float, default=1.0, metavar="0-2",
+                   help="how much of it falls, 1 being as designed; also the snow "
+                        "of shapes:snow and shapes:christmas")
+    p.add_argument("--aurora", type=float, default=1.0, metavar="0-2",
+                   help="shapes:aurora: how strong the northern lights are")
+    p.add_argument("--shooting-stars", type=float, default=0.6, metavar="PER_MINUTE",
+                   help="shapes:stars and shapes:aurora: how often a shooting star "
+                        "crosses, on average (0 = never)")
+    p.add_argument("--settle", action=argparse.BooleanOptionalAction, default=True,
+                   help="--weather snow: let it settle on you while you sit still")
     p.add_argument("--blur", type=float, default=40.0, help="blur mode: background defocus")
 
     p.add_argument("--aperture", type=float, default=45.0,
@@ -712,6 +728,9 @@ def main():
     ink = args.ink
     tool = args.tool
     active = []
+    falling = weather.Weather(args.weather, device) if args.weather else None
+    settle = args.settle
+    settled = weather.Settled()
     overlay = None
     if args.overlay:
         overlay = overlays.VideoOverlay(args.overlay, device, mode=args.overlay_mode,
@@ -763,6 +782,10 @@ def main():
         if name in SCENES:
             active.append(SCENES[name](device))
             return True
+        # Not a scene but fired like one: across the night sky, if that is the
+        # background, and otherwise nothing.
+        if name == "shooting_star" and hasattr(background_source, "shoot"):
+            return background_source.shoot()
         return False
 
     frames, fps_now, t0 = 0, 0.0, time.monotonic()
@@ -838,6 +861,16 @@ def main():
                                 preview.close()
                                 preview = None
                                 events.add("preview: off")
+                        if "weather" in msg:
+                            kind = msg["weather"]
+                            if kind is None or kind in weather.KINDS:
+                                falling = weather.Weather(kind, device) if kind else None
+                                events.add(f"weather: {kind or 'off'}")
+                            else:
+                                warn(f"unknown weather {kind!r} "
+                                     f"(have {', '.join(weather.KINDS)})")
+                        if "settle" in msg:
+                            settle = bool(msg["settle"])
                         if "trigger" in msg and start(msg["trigger"]):
                             events.add(f"trigger: {msg['trigger']}")
                         if msg.get("snapshot"):
@@ -961,10 +994,22 @@ def main():
                 # where you are, and this is the first point the matte exists.
                 if background_source is not None and hasattr(background_source, "observe"):
                     background_source.observe(pha)
+                    background_source.snowfall = settings["weather_amount"]
+                    background_source.aurora = settings["aurora"]
+                    background_source.shooting_stars = settings["shooting_stars"]
                 # A video background hands over a new frame here; a still one hands
                 # back the same tensor every time.
                 background = background_source.sample(height, width) \
                     if background_source is not None else None
+                if falling is not None:
+                    falling.flakes.amount = settings["weather_amount"]
+                    falling.step(dt, height, width)
+                    # Into the plate, so cinematic mode's own compositing puts
+                    # you in front of it. A background that already snows is
+                    # not snowed on twice.
+                    if background is not None and not (
+                            falling.kind == "snow" and getattr(background_source, "snow", None)):
+                        background = falling.layer(background, near=False)
 
                 # One virtual camera move per frame, applied to the plate only: the
                 # subject is composited afterwards so its edge cannot smear into
@@ -1020,6 +1065,9 @@ def main():
                 if background is None and (pdx or pdy):
                     base = effects.parallax(base, d, pdx, pdy, focus)
 
+                if falling is not None and background is None:
+                    base = falling.layer(base, near=False)
+
                 # After the camera move: the panel is in your hand, not in the room.
                 if panel is not None:
                     base = panel.draw(base)
@@ -1053,7 +1101,15 @@ def main():
                     front = drawing.over(ink_front, front)
                     behind = drawing.over(ink_behind, behind)
                 out = particles.composite(base, subject, subject_alpha, front, behind)
-                budget.lap("particles")    # and the ink, which shares their layers
+                if falling is not None and falling.kind == "snow" and settle:
+                    settled.update(torch.zeros_like(pha) if muted else pha, dt,
+                                   fall=settings["weather_amount"])
+                    out = settled.draw(out)
+                else:
+                    settled.clear()
+                if falling is not None:
+                    out = falling.layer(out, near=True)
+                budget.lap("particles")    # and the ink and the weather
 
                 if clip_layer == "front":
                     out = overlays.composite_over(out, clip)
@@ -1126,6 +1182,8 @@ def main():
                             "pinch": pinching,
                             "pinch_gap": detector.pinch_gap if detector else None,
                             "scenes": [s.name for s in active],
+                            "weather": falling.kind if falling else None,
+                            "settle": settle,
                             "overlay": overlay.path if overlay else None,
                             "overlay_layer": overlay.layer if overlay else args.overlay_layer,
                             "background": background_source.path if background_source else None,

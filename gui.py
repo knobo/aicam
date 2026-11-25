@@ -30,13 +30,17 @@ BACKGROUNDS = os.path.join(HERE, "backgrounds")
 # tests/test_shapes.py keeps the two in step.
 # Spec, tile label, glyph, and whether the tile wears the warm status colour.
 # Three to a row; the second row is the seasons, and SEASON is whichever of
-# them the calendar says, or the gold between them.
+# them the calendar says, or the gold between them. The third has nothing
+# floating in it: an evening of snow, and the sky.
 SHAPES = [("shapes", "3D GOLD", "◆", True),
           ("shapes:dusk", "3D DUSK", "◈", False),
           ("shapes:studio", "3D STUDIO", "◇", False),
           ("shapes:christmas", "3D CHRISTMAS", "❄", False),
           ("shapes:easter", "3D EASTER", "✿", False),
-          ("shapes:season", "3D SEASON", "◷", False)]
+          ("shapes:season", "3D SEASON", "◷", False),
+          ("shapes:snow", "SNOW", "❅", False),
+          ("shapes:stars", "STARS", "✧", False),
+          ("shapes:aurora", "AURORA", "≋", False)]
 IMAGE_OR_VIDEO = ("*.jpg", "*.jpeg", "*.png", "*.webp",
                   "*.mp4", "*.mov", "*.mkv", "*.webm", "*.gif", "*.avi")
 VIDEO = ("*.mp4", "*.mov", "*.mkv", "*.webm", "*.gif", "*.avi")
@@ -44,6 +48,10 @@ VIDEO = ("*.mp4", "*.mov", "*.mkv", "*.webm", "*.gif", "*.avi")
 SCENES = ["confetti", "hearts", "fireworks", "balloons", "rain"]
 SCENE_GLYPHS = {"confetti": "✦", "hearts": "♥", "fireworks": "✺",
                 "balloons": "◍", "rain": "⁞"}
+# weather.KINDS, spelled out for the same reason as SHAPES.
+# tests/test_weather.py keeps the two in step.
+WEATHER = [("snow", "❄"), ("rain", "⁞"), ("leaves", "❧"), ("petals", "✿"),
+           ("fireflies", "✺")]
 INKS = ["white", "yellow", "pink", "cyan", "green", "orange"]
 TOOLS = ["pen", "laser", "line", "rect", "eraser"]
 SLIDERS = [
@@ -55,6 +63,12 @@ SLIDERS = [
     ("parallax", 0, 6, "Parallax (3D)"),
     ("frame_zoom", 1, 2.5, "Auto-frame zoom"),
     ("ink_width", 1, 20, "Ink width"),
+]
+# The same, but they live under WEATHER, next to what they turn up and down.
+WEATHER_SLIDERS = [
+    ("weather_amount", 0, 2, "How much falls"),
+    ("aurora", 0, 2, "Aurora strength"),
+    ("shooting_stars", 0, 6, "Shooting stars a minute"),
 ]
 # What aicam prints on stderr as it starts, in order, so the panel can tell how
 # far a launch has come. Lines missing (no gestures) just skip a step.
@@ -140,6 +154,28 @@ class Panel:
         hud.Button(box, "✕ CLEAR ALL", self.clear, color=hud.AMBER).grid(
             row=1, column=0, columnspan=len(SCENES), sticky="ew", pady=(4, 0))
 
+        self.vars = {}
+        self.sliders = {}
+        box = self._section(body, "WEATHER")
+        self.weather, self.weather_tiles = None, {}
+        for i, (name, glyph) in enumerate(WEATHER):
+            # The tile of what is falling now turns it off again.
+            tile = hud.Button(box, name.upper(), lambda n=name: self.send(
+                {"weather": None if self.weather == n else n}), glyph=glyph, height=46)
+            tile.grid(row=0, column=i, sticky="ew", padx=(0 if i == 0 else 4, 0))
+            box.columnconfigure(i, weight=1, uniform="tile")
+            self.weather_tiles[name] = tile
+        self.settle = tk.BooleanVar(value=True)
+        hud.Toggle(box, "SNOW SETTLES ON YOU", self.settle,
+                   lambda: self.send({"settle": self.settle.get()})).grid(
+            row=1, column=0, columnspan=3, sticky="ew", pady=(4, 0))
+        # Only a night sky has anywhere for one to go: STARS or AURORA below.
+        hud.Button(box, "☄ SHOOTING STAR", lambda: self.trigger("shooting_star")).grid(
+            row=1, column=3, columnspan=2, sticky="ew", padx=(4, 0), pady=(4, 0))
+        for i, entry in enumerate(WEATHER_SLIDERS):
+            self._slider(box, *entry).grid(row=2 + i, column=0, columnspan=len(WEATHER),
+                                           sticky="ew")
+
         box = self._section(body, "SYSTEMS")
         self.preview = tk.BooleanVar()
         self.muted = tk.BooleanVar()
@@ -189,14 +225,8 @@ class Panel:
 
         box = self._section(body, "OPTICS")
         box.columnconfigure(0, weight=1)
-        self.vars = {}
-        self.sliders = {}
-        for i, (key, lo, hi, label) in enumerate(SLIDERS):
-            var = tk.DoubleVar()
-            self.vars[key] = var
-            self.sliders[key] = hud.Slider(box, label.upper(), lo, hi, var,
-                                           lambda k=key: self.on_slide(k))
-            self.sliders[key].grid(row=i, column=0, sticky="ew")
+        for i, entry in enumerate(SLIDERS):
+            self._slider(box, *entry).grid(row=i, column=0, sticky="ew")
 
         box = self._section(body, "OVERLAY")
         box.columnconfigure((1, 3), weight=1)
@@ -378,6 +408,13 @@ class Panel:
         """Back to aicam's built-in defaults, by emptying the file."""
         settings.save({})
         self._load_startup()
+
+    def _slider(self, box, key, lo, hi, label):
+        """A slider for one of aicam's tunables, kept where `refresh` finds it."""
+        self.vars[key] = var = tk.DoubleVar()
+        self.sliders[key] = hud.Slider(box, label.upper(), lo, hi, var,
+                                       lambda: self.on_slide(key))
+        return self.sliders[key]
 
     def _section(self, body, title):
         """A titled block in the scrolling body; returns the frame to fill."""
@@ -805,6 +842,10 @@ class Panel:
             self.mirror.set(bool(state.get("mirror")))
             self.gestures.set(bool(state.get("gestures")))
             self.auto_frame.set(bool(state.get("auto_frame")))
+            self.settle.set(bool(state.get("settle", True)))
+            self.weather = state.get("weather")
+            for name, tile in self.weather_tiles.items():
+                tile.configure(color=hud.AMBER if name == self.weather else hud.CYAN)
             if not self._in_box(self.layer_box):
                 self.overlay_layer.set(state.get("overlay_layer", "front"))
             self.draw.set(bool(state.get("draw")))

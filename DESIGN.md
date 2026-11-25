@@ -170,6 +170,58 @@ is plain numpy: the field's gradient pushes a shape away, and the field rising
 under a shape - you moving into it - gives it an extra kick, which is what turns
 leaning sideways into the shapes bouncing off.
 
+## Weather
+
+`--weather` reuses the snow of the Christmas background (`shapes3d.Snow`):
+points in the shapes' space, splatted bilinearly into a small image, blurred
+into discs and scaled up, in a far and a near layer. `weather.py` makes the
+other kinds by changing its numbers, and the main loop puts the far layer into
+the background plate and the near one over the composited frame:
+
+    background + far flakes -> particles behind -> subject
+               -> particles in front -> settled snow -> near flakes
+
+The far layer goes into the plate rather than over the base because cinematic
+mode with a background composites you itself; over the base it would snow on
+your face. Flakes are not tested against the depth map: two layers either side
+of you read as depth, and a per-flake test would need them drawn one by one.
+
+Each flake carries a colour, so the splat is four planes: colour times cover,
+and cover. Where flakes pile up the cover is clamped to 1 and the colour is
+scaled with it, which for snow is exactly the old "lighten towards white".
+
+Rain's streaks are not a long blur. A 31-tap vertical blur at half the frame's
+size measured 10 ms; instead the rain is splatted into cells twelve pixels
+tall and two wide, and scaling those up is what stretches a drop. 1.2 ms.
+
+**Settled snow** is all matte, at a quarter of the frame. The matte is lifted a
+little, and for each pixel the drop is taken from the mean of the rows above it
+to itself: 1 on the top edge, falling to 0 a few rows in, 0 down a side. That
+is the rate a pixel fills at, so the cap starts as a line along the very top
+and grows downwards, and it is drawn where a pixel is more than half full. A
+drop, not the product "you here, not you above": a soft edge down the side of
+an arm is half you all the way down, and half of a half slowly snowed it in.
+A fixed, lumpy rate map keeps it from being an even outline. Where the matte
+changed since the last frame, or there is no longer an edge to lie on, it
+melts in a third of a second.
+
+The skies (`shapes:snow`, `shapes:stars`, `shapes:aurora`) are the shapes
+background with an empty swarm: the same wall and glows, no shadows. Stars are
+drawn once per frame size and multiplied by a coarse grid of sines, one phase
+and rate per cell, so twinkling costs a sine over a 1/64 size image. The
+aurora is evaluated with the wall at quarter size, where it is soft anyway.
+
+The amount slider does not respawn anything. Twice the designed number of
+flakes exist and fall all the time, and the amount is how many of them are
+given any weight, the last one fractionally, so dragging the slider fades
+flakes in and out instead of reshuffling the sky.
+
+A shooting star is a line drawn from its distance field over the whole frame,
+for the 0.7 s it lasts: far simpler than a moving sprite, and nothing at all
+the rest of the time. It is fired like a reaction (`trigger: shooting_star`)
+but belongs to the background, which is the only thing that knows whether
+there is a night sky for it to cross.
+
 ## Background replacement that understands depth
 
 A matte only knows "person" and "not person". Hold up a book and it vanishes the

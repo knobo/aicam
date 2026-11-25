@@ -29,6 +29,8 @@ KEYS = {
     "gesture_face_guard": bool,
     "mode": str,
     "background": (str, type(None)),
+    "weather": (str, type(None)),
+    "settle": bool,
     "aperture": float,
     "light": float,
     "rim": float,
@@ -37,6 +39,9 @@ KEYS = {
     "parallax": float,
     "frame_zoom": float,
     "ink_width": float,
+    "weather_amount": float,
+    "aurora": float,
+    "shooting_stars": float,
     "ink": str,
     "tool": str,
 }

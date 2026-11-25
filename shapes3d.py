@@ -85,6 +85,13 @@ PALETTES = {
                       sizes=(0.85, 1.1)),
     "easter": dict(inner="#fff6dc", outer="#f1d3a2", glows=("#ffd1e3", "#c9f2d6"),
                    glow=0.45, materials="dusk", season="easter", sizes=(0.7, 0.95)),
+    # Nothing floating: Christmas's evening with only the snow, and the sky.
+    "snow":   dict(inner="#1a2c44", outer="#050a14", glows=("#5a3410", "#0e3d2c"),
+                   glow=0.4, materials="noir", empty=True, snow=True),
+    "stars":  dict(inner="#0c1230", outer="#02030a", glows=("#1d1648", "#0a2433"),
+                   glow=0.3, materials="noir", empty=True, stars=True),
+    "aurora": dict(inner="#081226", outer="#010308", glows=("#0c2a2a", "#150f33"),
+                   glow=0.25, materials="noir", empty=True, stars=True, aurora=True),
 }
 DEFAULT = "noir"
 # Not a palette: whichever season it is, and the default between them.
@@ -484,7 +491,8 @@ class Swarm:
         self.pos = np.stack([u * z * self.tan_x, v * z * self.tan_y, z], 1)
         self.home = self.pos.copy()
         self.vel = np.zeros((count, 3))
-        self.rot = np.stack([_random_rotation(rng) for _ in range(count)])
+        self.rot = np.stack([_random_rotation(rng) for _ in range(count)]) \
+            if count else np.zeros((0, 3, 3))
         self.spin = _unit(rng.normal(size=(count, 3))) * \
             rng.uniform(0.05, 0.14, count)[:, None]
         self.phase = rng.uniform(0, 2 * math.pi, (count, 3))
@@ -1037,17 +1045,32 @@ class Snow:
     which is blurred into discs and scaled up. The far layer is splatted at an
     eighth of the frame and the near one at a quarter, so near flakes come out
     bigger and softer, as they would through a lens focused on the shapes.
+
+    The numbers below are snow. weather.py makes rain, leaves, petals and
+    fireflies out of the same class by changing them.
     """
 
     COUNT = 420
     FALL = 0.55              # world units a second; a calm evening, not a blizzard
+    SWAY, BOB = 0.18, 0.0    # drifting sideways, and up and down for what does not fall
+    COLOURS = [(0.97, 0.98, 1.0)]
+    # Near, then far: the fraction of the frame a layer is splatted at, across
+    # and down, and the blur, in splat cells, across and down.
+    SHRINK = ((4, 4), (8, 8))
+    SIGMA = ((0.8, 0.8), (0.8, 0.8))
+    GAIN = 1.0
+    FLICKER = (0.0, 0.0)     # how deep and how fast a flake's brightness wavers
+    MOST = 2.0               # `amount` goes from none to this many times COUNT
     SPLIT = (Z_NEAR + Z_FAR) / 2
 
     def __init__(self, device, seed=7):
         self.device = device
         g = torch.Generator(device="cpu").manual_seed(seed)
         r = lambda *shape: torch.rand(*shape, generator=g)
-        n = self.COUNT
+        # All it can ever be are there and falling; `amount` is how many are drawn.
+        n = int(self.COUNT * self.MOST)
+        self.amount = 1.0
+        self._order = torch.arange(n, device=device)
         tan_y = math.tan(FOV / 2)
         z = 4.0 + r(n) * (Z_WALL - 4.5)
         self.pos = torch.stack([(r(n) * 2 - 1) * z * tan_y * 2.0,
@@ -1055,52 +1078,72 @@ class Snow:
         self.speed = (0.6 + r(n) * 0.8).to(device)
         self.phase = (r(n) * 2 * math.pi).to(device)
         self.bright = (0.55 + r(n) * 0.45).to(device)
+        self.colour = torch.tensor(self.COLOURS)[
+            torch.randint(len(self.COLOURS), (n,), generator=g)].to(device)
         self.t = 0.0
 
     def step(self, dt, tan_x, tan_y):
         self.t += dt
         p = self.pos
         z = p[:, 2]
-        p[:, 1] += self.FALL * self.speed * dt
-        p[:, 0] += 0.18 * torch.sin(0.7 * self.t * self.speed + self.phase) * dt
+        p[:, 1] += (self.FALL * self.speed
+                    + self.BOB * torch.cos(0.9 * self.t * self.speed + 2 * self.phase)) * dt
+        p[:, 0] += self.SWAY * torch.sin(0.7 * self.t * self.speed + self.phase) * dt
         # Out at the bottom, in again at the top; out at a side, in at the other.
         bottom = z * tan_y * 1.1
         p[:, 1] = torch.where(p[:, 1] > bottom, p[:, 1] - 2 * bottom, p[:, 1])
+        p[:, 1] = torch.where(p[:, 1] < -bottom, p[:, 1] + 2 * bottom, p[:, 1])
         side = z * tan_x * 1.05
         p[:, 0] = torch.where(p[:, 0] > side, p[:, 0] - 2 * side, p[:, 0])
         p[:, 0] = torch.where(p[:, 0] < -side, p[:, 0] + 2 * side, p[:, 0])
 
+    @staticmethod
+    def _blur(img, sigma, across):
+        """A Gaussian with its peak at 1, along x or along y."""
+        radius = max(1, math.ceil(2.5 * sigma))
+        k = torch.exp(-0.5 * (torch.arange(-radius, radius + 1, device=img.device) / sigma) ** 2)
+        if across:
+            return F.conv2d(F.pad(img, (radius, radius, 0, 0)), k.view(1, 1, 1, -1))
+        return F.conv2d(F.pad(img, (0, 0, radius, radius)), k.view(1, 1, -1, 1))
+
     def layer(self, out, focal, near):
-        """Lighten `out` (3, H, W) with the near or the far flakes."""
+        """`out` (3, H, W) with the near or the far flakes over it."""
         height, width = out.shape[-2:]
         p = self.pos
         # Masked by weight rather than picked out: indexing by a mask waits
         # for the GPU to say how many there are, every frame.
         pick = (p[:, 2] < self.SPLIT) if near else (p[:, 2] >= self.SPLIT)
-        bright = self.bright * pick
-        shrink = 4 if near else 8
-        h, w = max(height // shrink, 2), max(width // shrink, 2)
-        u = (p[:, 0] / p[:, 2] * focal + width / 2) / shrink - 0.5
-        v = (p[:, 1] / p[:, 2] * focal + height / 2) / shrink - 0.5
+        # The last one in fades rather than pops as the amount is dragged.
+        bright = self.bright * pick * (self.amount * self.COUNT - self._order).clamp(0, 1)
+        which = 0 if near else 1
+        across, down = self.SHRINK[which]
+        h, w = max(height // down, 2), max(width // across, 2)
+        u = (p[:, 0] / p[:, 2] * focal + width / 2) / across - 0.5
+        v = (p[:, 1] / p[:, 2] * focal + height / 2) / down - 0.5
         # Nearer is bigger and brighter; the far ones fade into the wall.
-        weight = bright * (9.0 / p[:, 2]).clamp(max=1.4) * (1.5 if near else 0.9)
+        weight = bright * (9.0 / p[:, 2]).clamp(max=1.4) * (1.5 if near else 0.9) * self.GAIN
+        depth, rate = self.FLICKER
+        if depth:
+            weight = weight * (1 - depth * (0.5 + 0.5 * torch.sin(
+                rate * self.t * self.speed + 3 * self.phase)))
+        # Colour times cover, and the cover itself: four planes, splatted alike.
+        values = torch.cat([self.colour.T, torch.ones_like(weight)[None]]) * weight
         x0, y0 = u.floor(), v.floor()
         fx, fy = u - x0, v - y0
-        img = torch.zeros(h * w, device=out.device)
+        img = torch.zeros(4, h * w, device=out.device)
         for dx, dy, wt in ((0, 0, (1 - fx) * (1 - fy)), (1, 0, fx * (1 - fy)),
                            (0, 1, (1 - fx) * fy), (1, 1, fx * fy)):
             x, y = (x0 + dx).long(), (y0 + dy).long()
             ok = (x >= 0) & (x < w) & (y >= 0) & (y < h)
-            img.index_add_(0, (y.clamp(0, h - 1) * w + x.clamp(0, w - 1)), weight * wt * ok)
-        img = img.view(1, 1, h, w)
-        k = torch.exp(-0.5 * (torch.arange(-2, 3, device=out.device) / 0.8) ** 2)
-        k = (k / k.max()).view(1, 1, 1, -1)
-        img = F.conv2d(F.pad(img, (2, 2, 0, 0)), k)
-        img = F.conv2d(F.pad(img, (0, 0, 2, 2)), k.transpose(2, 3))
-        img = F.interpolate(img.clamp_(0, 1), size=(height, width), mode="bilinear",
-                            align_corners=False)[0]
-        white = torch.tensor([0.97, 0.98, 1.0], device=out.device).view(3, 1, 1)
-        return torch.lerp(out, white.expand_as(out), img)
+            img.index_add_(1, (y.clamp(0, h - 1) * w + x.clamp(0, w - 1)), values * (wt * ok))
+        img = img.view(4, 1, h, w)
+        sx, sy = self.SIGMA[which]
+        img = self._blur(self._blur(img, sx, True), sy, False)
+        # Where flakes pile up the cover stops at 1, and the colour with it.
+        img = img / img[3:].clamp(min=1.0)
+        img = F.interpolate(img, size=(height, width), mode="bilinear",
+                            align_corners=False)[:, 0]
+        return out * (1 - img[3]) + img[:3]
 
 
 class ShapesBackground:
@@ -1112,13 +1155,24 @@ class ShapesBackground:
         self.palette = PALETTES[palette_of(spec)]
         self._materials = MATERIALS[self.palette["materials"]]
         season = self.palette.get("season")
-        if season:
+        if self.palette.get("empty"):
+            self.swarm = Swarm(seed=seed, cast=[])
+        elif season:
             import seasons
             self.swarm = Swarm(seed=seed, cast=seasons.cast(season, seed=seed),
                                sizes=self.palette.get("sizes", (0.5, 0.85)))
         else:
             self.swarm = Swarm(count=count, seed=seed)
         self.snow = Snow(device, seed=seed) if self.palette.get("snow") else None
+        # How much it snows and how strong the aurora is, 1 being as designed.
+        self.snowfall = self.aurora = 1.0
+        # A night sky's shooting stars, a minute: seldom enough that one is
+        # still an event. The wait is counted in mean gaps rather than seconds,
+        # so changing the rate changes when the next one comes, not the one after.
+        self.shooting_stars = 0.6
+        self._meteor = None
+        self._meteor_wait = self.swarm.rng.uniform(0.5, 1.5)
+        self._meteor_clock = 0.0
         self._build()
         self._clock = None
         self._dither = None
@@ -1193,8 +1247,22 @@ class ShapesBackground:
         self._clock = now
         self.swarm.step(dt)
         if self.snow is not None:
+            self.snow.amount = self.snowfall
             self.snow.step(min(dt, 0.05), self.swarm.tan_x, self.swarm.tan_y)
         return self.render(height, width).to(self.dtype)
+
+    def shoot(self):
+        """A shooting star, now. False where there is no night sky to cross."""
+        if not self.palette.get("stars"):
+            return False
+        rng = self.swarm.rng
+        slope = math.radians(rng.uniform(15, 45))
+        # When, where from as a fraction of the frame, and which way: high up,
+        # and falling to one side or the other.
+        self._meteor = (self.swarm.t, rng.uniform(0.15, 0.85), rng.uniform(0.05, 0.3),
+                        rng.choice([-1.0, 1.0]) * math.cos(slope), math.sin(slope))
+        self._meteor_wait = rng.uniform(0.5, 1.5)
+        return True
 
     def close(self):
         pass
@@ -1233,9 +1301,26 @@ class ShapesBackground:
         # Tinted: a coloured shape throws a shadow with some of its colour in it.
         keep = 1 - strength[:, None] * (1 - (tints * 0.55).view(-1, 3, 1, 1))
         wall = wall * keep.prod(0)
+        if self.palette.get("aurora"):
+            import weather
+            wall = wall + weather.aurora(x, y, t) * self.aurora
 
         wall = F.interpolate(wall[None], size=(height, width), mode="bilinear",
                              align_corners=False)[0]
+        if self.palette.get("stars"):
+            import weather
+            wall = wall + weather.stars(height, width, t, dev)
+            self._meteor_wait -= (t - self._meteor_clock) * self.shooting_stars / 60
+            self._meteor_clock = t
+            if self._meteor_wait <= 0:
+                self.shoot()
+            if self._meteor is not None:
+                streak = weather.meteor(height, width, t - self._meteor[0],
+                                        *self._meteor[1:], dev)
+                if streak is None:
+                    self._meteor = None
+                else:
+                    wall = wall + streak
         # Gradients this smooth band in eight bits; grain below one step hides it.
         if self._dither is None or self._dither.shape[-2:] != (height, width):
             g = torch.Generator(device="cpu").manual_seed(1)
@@ -1286,13 +1371,18 @@ class ShapesBackground:
         drawn = [(b["index"], *self._shade(b, height, width, focal, c, rot, size))
                  for b in self._batches]
 
-        idx = [i for b in drawn for i in b[0]]
-        u = torch.cat([b[6] for b in drawn])
-        v = torch.cat([b[7] for b in drawn])
-        radius = torch.cat([b[8] for b in drawn])
-        tints = (self._colours[idx].mean(1)) ** (1 / 2.2)
-        weight = torch.tensor([0.55 if sw.hollow[i] else 1.0 for i in idx], device=dev)
-        out = self._backdrop(height, width, u, v, radius, c[idx, 2], tints, weight)
+        if drawn:
+            idx = [i for b in drawn for i in b[0]]
+            u = torch.cat([b[6] for b in drawn])
+            v = torch.cat([b[7] for b in drawn])
+            radius = torch.cat([b[8] for b in drawn])
+            tints = (self._colours[idx].mean(1)) ** (1 / 2.2)
+            weight = torch.tensor([0.55 if sw.hollow[i] else 1.0 for i in idx], device=dev)
+            out = self._backdrop(height, width, u, v, radius, c[idx, 2], tints, weight)
+        else:               # nothing floating, so no shadows on the wall either
+            none = torch.zeros(0, device=dev)
+            out = self._backdrop(height, width, none, none, none, none,
+                                 torch.zeros(0, 3, device=dev), none)
         if self.snow is not None:
             out = self.snow.layer(out, focal, near=False)
 

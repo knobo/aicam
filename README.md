@@ -51,6 +51,10 @@ What it does, in one list:
   drifting around and moving out of your way when you move - and in season,
   presents, gingerbread men, a nisse and a reindeer in the snow, or eggs and
   chicks at Easter
+- **Weather** over any background: snow, rain, autumn leaves, cherry petals or
+  fireflies, behind you and in front - and snow that settles on your head and
+  shoulders while you sit still. Or a sky with nothing in it: an evening of
+  snow, stars, northern lights
 - **Draw in the air** with your finger, and the ink keeps the depth you drew it at
 - **Hand gestures** to fire any of it, plus a Tk panel and a CLI for when they misfire
 - **Auto-framing** and a virtual camera move, from one still camera
@@ -317,6 +321,62 @@ Make it the startup background and the camera dresses for the season by itself.
 Each figure is a few dozen convex blocks and ellipsoids, each in its own
 material, traced like the other shapes. Christmas costs about 9 ms a frame at
 1080p, snow included, against 7 for the gold shapes.
+
+### Weather, and a sky with nothing in it
+
+```sh
+./aicam --weather snow                     # over your own room
+./aicam --weather rain --background backgrounds/dusk.jpg
+./aicam --background shapes:snow          # the Christmas evening, without the figures
+./aicam --background shapes:stars         # a night sky that twinkles
+./aicam --background shapes:aurora --weather snow
+
+./aicamctl weather petals                 # snow, rain, leaves, petals, fireflies, off
+./aicamctl settle off                     # snow falls, but no longer lies on you
+./aicamctl set weather_amount=1.6         # 0 to 2: how much falls
+./aicamctl set aurora=0.5                 # 0 to 2: how strong the northern lights are
+./aicamctl set shooting_stars=2           # 0 to 6 a minute, on average
+./aicamctl shooting_star                  # one, now, across shapes:stars or shapes:aurora
+```
+
+`--weather` is a layer of its own, not a background: the far half of it goes
+into whatever is behind you - the room, an image, a video, your screen, the 3D
+shapes - and the near half over the finished frame, so you sit in the middle of
+it. It is the snow of the Christmas background with other numbers: rain is many
+and fast and drawn out into streaks, leaves and petals are few, coloured and
+fluttering (soft dots of colour, not leaf shapes), and fireflies do not fall
+but wander and pulse. About 2 ms a frame at 1080p, whichever it is.
+
+With `--weather snow` the snow also **settles on you**: sit still and after a
+few seconds a line of it shows along the top of your head and shoulders, and
+keeps getting deeper. Move, and it is gone where you moved - nod and your head
+is clear while your shoulders keep theirs. It follows your outline, so it lies
+on what faces up and is seen against the background, not in your lap.
+`--no-settle`, `aicamctl settle off`, or the switch in the panel's WEATHER
+section turns it off; it is on by default and does nothing unless it snows.
+
+`shapes:snow`, `shapes:stars` and `shapes:aurora` are backgrounds like the 3D
+shapes, with the same wall and drifting glows, but nothing floats in them.
+`shapes:snow` is `shapes:christmas` with only the snow. The stars twinkle each
+at their own pace; the aurora is three green curtains that fade into violet
+and waver. They snow behind you only - add `--weather` for the half in front.
+
+**How much** is the first two sliders in the panel's WEATHER section, and
+`--weather-amount` and `--aurora` at startup, each from 0 to 2 with 1 as
+designed. The first is how many flakes, drops or fireflies there are, for the
+weather and for the snow that `shapes:snow` and `shapes:christmas` bring
+themselves; twice the snow also settles on you twice as fast. The second is the
+aurora's brightness.
+
+The night skies have a **shooting star** now and then, high up, thin and
+faint, gone in 0.7 s. How often is the third slider, `--shooting-stars` at
+startup: so many a minute on average, 0.6 as it comes - one every 50 to 150
+seconds - up to 6, and 0 for never. Dragging it changes when the next one
+comes, not just the ones after. The panel's ☄ SHOOTING STAR button, or
+`aicamctl shooting_star`, sends one at once; against any other background it
+does nothing.
+
+A recording in `green` or `alpha` leaves the weather out, as it does particles.
 
 ### Your screen as the background
 
@@ -586,6 +646,8 @@ Everything is reachable at runtime over that socket:
 ./aicamctl mirror / mute / preview    # each takes a trailing 'off'
 ./aicamctl gestures off               # stop reactions, keep hand tracking
 ./aicamctl auto_frame
+./aicamctl weather snow               # or rain, leaves, petals, fireflies, off
+./aicamctl settle off                 # snow no longer lies on you
 ./aicamctl snapshot                   # the output frame, as a PNG in ~/Pictures
 ./aicamctl record                     # record what the meeting sees, to ~/Videos
 ./aicamctl record green [file.mp4]    # you alone on #00FF00, for a chroma key
